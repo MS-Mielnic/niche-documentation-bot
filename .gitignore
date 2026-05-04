@@ -1,0 +1,9 @@
+# Environments
+niche-bot-env/
+__pycache__/
+
+# Secrets
+.env
+
+# Vector Database
+chroma_db/
