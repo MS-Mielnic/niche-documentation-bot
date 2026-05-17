@@ -1,4 +1,6 @@
 # src/mcp/github_client.py
+import base64
+import mimetypes
 import os
 import httpx
 from typing import List, Dict, Optional
@@ -86,13 +88,69 @@ class GitHubClient:
             
     async def read_single_file(self, repo_id: str, file_path: str):
         """
-        Downloads the raw content of a specific file from GitHub.
+        Reads a single file from the target repository via raw GitHub content URLs.
+        Bypasses string encoders for binary files to keep data streams pristine.
         """
+        is_binary = file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf'))
+        
+        # Construct the raw download endpoint URL
         url = f"https://raw.githubusercontent.com/{repo_id}/main/{file_path}"
+        
         async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            if response.status_code != 200:
-                # Fallback for 'master' branches
+            response = await client.get(url, headers=self.headers)
+            
+            # Fallback check if the main branch is configured as 'master'
+            if response.status_code == 404:
                 url = url.replace("/main/", "/master/")
-                response = await client.get(url)
-            return response.text
+                response = await client.get(url, headers=self.headers)
+                
+            if response.status_code == 200:
+                if is_binary:
+                    # 🎯 Return raw bytes directly to protect multimedia hex values
+                    return response.content  
+                else:
+                    # Return clear text strings for text assets
+                    return response.text
+            else:
+                raise httpx.HTTPStatusError(
+                    f"Failed to fetch file {file_path}. Status: {response.status_code}",
+                    request=response.request,
+                    response=response
+                )
+        
+    async def download_image_as_base64(self, repo_id: str, file_path: str) -> str | None:
+        """
+        Downloads an image asset file from the GitHub repository 
+        and transforms it into a clean Base64 Data URI string.
+        """
+        print(f"--- FETCHING IMAGE FOR MULTIMODAL CONVERSION: {file_path} ---")
+        
+        url = f"https://api.github.com/repos/{repo_id}/contents/{file_path}"
+        headers = self.headers.copy() 
+        headers["Accept"] = "application/vnd.github.v3.raw"
+
+        try:
+            # FIX: Swap out the undefined 'self.session' for your class standard 'httpx' client pattern
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers)
+                
+                if response.status_code == 200:
+                    image_bytes = response.content
+                    
+                    # Transform raw visual binary arrays into clean Base64 strings
+                    base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    mime_type, _ = mimetypes.guess_type(file_path)
+                    if not mime_type:
+                        mime_type = "image/png" 
+                        
+                    data_uri = f"data:{mime_type};base64,{base64_encoded}"
+                    print(f"✅ Successfully downloaded and encoded asset: {file_path}")
+                    return data_uri
+                else:
+                    print(f"❌ Failed to download asset {file_path}. Status: {response.status_code}")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Error during image base64 processing for {file_path}: {e}")
+            return None

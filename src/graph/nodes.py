@@ -1,16 +1,19 @@
 # src/graph/nodes.py
-from src.observability.telemetry import log_rag_retrieval
+# from src.observability.telemetry import log_rag_retrieval
 from typing import Dict, Any
-from src.rag.vector_store import get_local_hash, save_local_hash
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage 
 from langgraph.types import interrupt
 
 from src.graph.state import AgentState
-from src.mcp.github_client import GitHubClient
-from src.rag.vector_store import get_vector_store, check_if_repo_exists
-from src.rag.ingestion import ingest_repository
+
+# --- 🚨 THE CRITICAL V2 UPDATES 🚨 ---
+from src_v2.mcp.github_client import GitHubClient
+from src_v2.rag.vector_store import get_local_hash, save_local_hash, get_vector_store, check_if_repo_exists
+from src_v2.rag.ingestion import ingest_repository
+from src_v2.rag.parent_store import get_parent
 
 # --- NODE 0: INTENT CLASSIFICATION ---
 def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:

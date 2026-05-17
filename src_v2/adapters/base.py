@@ -1,4 +1,4 @@
-# src/adapters/base.py
+# src_v2/adapters/base.py
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -9,9 +9,10 @@ class BaseChatAdapter(ABC):
     """
 
     @abstractmethod
-    async def send_message(self, channel_id: str, text: str) -> Dict[str, Any]:
+    async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
         """
-        Send a standard text message to the user/channel.
+        Send a standard text message to the user/channel. 
+        Optionally supports rendering a list of image URLs inline.
         """
         pass
 

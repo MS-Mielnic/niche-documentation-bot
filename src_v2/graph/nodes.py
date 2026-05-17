@@ -1,16 +1,24 @@
-# src/graph/nodes.py
-from src.observability.telemetry import log_rag_retrieval
+# src_v2/graph/nodes.py
+from src_v2.observability.telemetry import log_rag_retrieval
 from typing import Dict, Any
-from src.rag.vector_store import get_local_hash, save_local_hash
+from src_v2.rag.vector_store import get_local_hash, save_local_hash, get_vector_store, check_if_repo_exists
+from src_v2.rag.ingestion import ingest_repository
+from src_v2.rag.parent_store import get_parent # NEW: The Heavy Parent Store
+from src_v2.mcp.github_client import GitHubClient
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
+# NEW: Required for Multimodal Prompting
+from langchain_core.messages import HumanMessage, SystemMessage 
 from langgraph.types import interrupt
+from src_v2.graph.state import AgentState
 
-from src.graph.state import AgentState
-from src.mcp.github_client import GitHubClient
-from src.rag.vector_store import get_vector_store, check_if_repo_exists
-from src.rag.ingestion import ingest_repository
+
+# --- GLOBAL OLLAMA MODEL ALIASES ---
+# Aligned exactly with your local machine's 'ollama list' profiles
+TEXT_MODEL = "llama3.1:latest"
+VISION_MODEL = "llama3.2-vision:latest"
 
 # --- NODE 0: INTENT CLASSIFICATION ---
 def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
@@ -26,7 +34,7 @@ def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
         temperature=0, 
         base_url="http://localhost:11434/v1", 
         api_key="local-llm",
-        model="llama3.1" 
+        model=VISION_MODEL
     )
 
     prompt = ChatPromptTemplate.from_messages([
@@ -108,44 +116,202 @@ async def reply_to_greeting(state: AgentState, config: RunnableConfig) -> Dict[s
         )
     return {}
 
+# --- NODE 2: THE VISION INTERCEPTOR ---
 async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Node 2: The real RAG retrieval. Retrieves context from ChromaDB and answers the user.
+    Node 2 (V2): The Vision Interceptor.
+    Retrieves narrative text chunks, intercepts section-bounded structural anchors 
+    (images & directory trees) via metadata keys, restores them from the Heavy Store,
+    and dynamically configures payloads for Llama 3.1 or 3.2-Vision.
     """
-    print("--- NODE 2: PERFORMING VECTOR SEARCH & ANSWERING ---")
+    print("--- NODE 2: PERFORMING MULTIMODAL VECTOR SEARCH & ANSWERING ---")
     
-    # Prioritize selected_repo, fallback to parsing user request
-    repo_to_check = state.get("selected_repo") or state.get("user_request")
+    user_request = state["user_request"]
+    repo_to_check = state.get("selected_repo") or user_request
+    
     vector_db = get_vector_store(repo_to_check)
     
-    # UPGRADE: Use with_score to get the mathematical distance for our telemetry
-    docs_with_scores = vector_db.similarity_search_with_score(state["user_request"], k=4)
+    docs_with_scores = vector_db.similarity_search_with_score(user_request, k=6)
     
-    # Rebuild the context string using the doc from the tuple
-    context = "\n\n".join([f"Source: {doc.metadata.get('source', 'Unknown')}\n{doc.page_content}" for doc, score in docs_with_scores])
+    context_text = []
+    vision_images = []
+    original_image_paths = [] 
+    retrieved_tree_blocks = []
     
-    llm = ChatOpenAI(temperature=0, base_url="http://localhost:11434/v1", api_key="local-llm", model="llama3.1")
-    
-    prompt = f"Use this context to answer: {context}\n\nQuestion: {state['user_request']}"
-    response = await llm.ainvoke(prompt)
+    # 1. THE INTERCEPTOR LOOP
+    for doc, score in docs_with_scores:
+        metadata = doc.metadata
+        source = metadata.get("source", "Unknown")
 
+        # 🚨 TEMPORARY DATA DIAGNOSTIC LOGS (PRESERVED) 🚨
+        print("====== CHROMA METADATA DUMP ======")
+        print(f"Content Snippet: {doc.page_content[:50]}...")
+        print(f"Full Metadata Dict: {metadata}")
+        print(f"Raw 'image_path' from DB: {metadata.get('image_path')}")
+        print(f"Raw 'source' from DB: {metadata.get('source')}")
+        print("==================================")
+
+        # Standard Operation: Always append the direct page content retrieved
+        context_text.append(f"Source: {source}\n{doc.page_content}")
+
+        # 🎯 FIX: ANCHOR TYPE A - DETECT ADJACENT INLINE SECTION IMAGES
+        # Stamped right onto narrative text chunks by your stateful ingestion loop
+        image_path = metadata.get("image_path")
+        image_parent_id = metadata.get("parent_id")
+        element_type = metadata.get("element_type", "text")
+        
+        # Branch 1: Extracted via text chunk metadata pointer (Contextual Sync)
+        # --- Inside Node 2 Loop ---
+        # --- Inside src_v2/graph/nodes.py -> Node 2 Interceptor Loop ---
+        if image_path and image_parent_id:
+            if image_path not in original_image_paths:
+                
+                # 🎯 NEW: SEMANTIC CONTEXT GATE
+                # Extract the section header name (e.g., "## How the Backend Agent Works")
+                section_title = metadata.get("section", "").lower()
+                user_query = user_request.lower()
+                
+                # Clean up filenames for string matching (e.g., "agent.png" -> "agent")
+                image_keyword = image_path.split('.')[0].replace('_', ' ').replace('-', ' ')
+                
+                # CRITICAL VERIFICATION: Only load the image if the user is asking about 
+                # words in the section header, OR if the query mentions the image filename context directly.
+                # This perfectly blocks global 'app.png' from sneaking into a specific backend agent query!
+                is_relevant_section = any(word in user_query for word in section_title.split() if len(word) > 3)
+                is_explicit_image_request = any(kw in user_query for kw in image_keyword.split())
+                
+                if is_relevant_section or is_explicit_image_request or "root document" not in section_title:
+                    parent_data = get_parent(repo_to_check, image_parent_id)
+                    if parent_data:
+                        print(f"🎯 Interceptor Approved Relevant Image: {image_path} (Section: {metadata.get('section')})")
+                        
+                        # Extract and sanitize your base64 string completely
+                        raw_content = parent_data if isinstance(parent_data, str) else parent_data.get("content", "")
+                        clean_b64 = str(raw_content).strip().replace("\n", "").replace("\r", "")
+                        
+                        if not clean_b64.startswith("data:image/"):
+                            clean_b64 = f"data:image/png;base64,{clean_b64}"
+                            
+                        vision_images.append(clean_b64)
+                        original_image_paths.append(image_path)
+                        
+                        alt_text = parent_data.get("alt_text", "Diagram") if isinstance(parent_data, dict) else "Diagram"
+                        context_text.append(f"[System Note: Relevant engineering diagram '{alt_text}' has been provided for this topic segment.]")
+                else:
+                    print(f"🚫 Interceptor Filtered Out Unrelated Image: {image_path} (Belongs to section '{metadata.get('section')}', not contextually relevant to query.)")
+
+        # Branch 2: Legacy fallback if Chroma returns the raw standalone image token document itself
+        elif element_type == "image" and image_parent_id:
+            parent_data = get_parent(repo_to_check, image_parent_id)
+            if parent_data:
+                print(f"👁️ Interceptor: Loading Raw Standalone Image Document ({image_parent_id})")
+                vision_images.append(parent_data["content"])
+                fallback_path = metadata.get("image_path", "unknown_asset.png")
+                if fallback_path not in original_image_paths:
+                    original_image_paths.append(fallback_path)
+
+        # 🎯 FIX: ANCHOR TYPE B - DETECT ADJACENT INLINE SECTION DIRECTORY TREES
+        tree_parent_id = metadata.get("tree_parent_id")
+        
+        # Branch 1: Extracted via text chunk metadata pointer (Contextual Sync)
+        if tree_parent_id:
+            if tree_parent_id not in retrieved_tree_blocks:
+                parent_data = get_parent(repo_to_check, tree_parent_id)
+                if parent_data:
+                    print(f"🌲 Interceptor: Restoring Contextual Directory Tree ({tree_parent_id}) via text chunk pointer.")
+                    retrieved_tree_blocks.append(tree_parent_id)
+                    context_text.append(f"--- RELEVANT SECTION REPOSITORY LAYOUT ---\n{parent_data['content']}\n-------------------")
+
+        # Branch 2: Legacy fallback if Chroma returns the raw standalone table/tree document rows
+        elif element_type in ["table", "tree"] and image_parent_id: # uses parent_id for standalone rows
+            parent_data = get_parent(repo_to_check, image_parent_id)
+            if parent_data and image_parent_id not in retrieved_tree_blocks:
+                print(f"🧩 Interceptor: Restoring Standalone Row {element_type} ({image_parent_id})")
+                retrieved_tree_blocks.append(image_parent_id)
+                context_text.append(f"--- FULL {element_type.upper()} ---")
+                context_text.append(parent_data["content"])
+                context_text.append("-------------------")
+            
+    full_context = "\n\n".join(context_text)
+
+    # 3. DYNAMIC MODEL ROUTING
+    if vision_images:
+        print(f"🧠 ROUTING: Image detected. Invoking {VISION_MODEL}...")
+        llm = ChatOpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="local-llm",
+            model=VISION_MODEL,
+            temperature=0
+        )
+        
+        # Structure payload cleanly for LangChain + Ollama OpenAI Endpoint Specs
+        content_list = [{"type": "text", "text": f"Context:\n{full_context}\n\nQuestion: {user_request}"}]
+        
+        for b64_uri in vision_images:
+            content_list.append({
+                "type": "image_url", 
+                "image_url": {
+                    "url": b64_uri  # Contains the validated 'data:image/png;base64,...' string
+                }
+            })
+            
+        messages = [
+            SystemMessage(content="""You are an expert technical analyst with vision capabilities.
+            Use the provided text context and images to answer the user's question precisely.
+            
+            CRITICAL FORMATTING RULES:
+            1. Never mention or write out filenames like 'agent.png' or markdown image text.
+            2. Never output HTML tags like <img> or markdown images like ![](...) under any circumstances.
+            3. Do not tell the user an image has been provided or is shown below. Simply provide your raw technical explanation text."""),
+            HumanMessage(content=content_list)
+        ]
+        
+    else:
+        print("⚡ ROUTING: Text only. Invoking Llama 3.1 (8B)...")
+        llm = ChatOpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="local-llm",
+            model=TEXT_MODEL,
+            temperature=0
+        )
+        
+        prompt = f"Use this context to answer:\n{full_context}\n\nQuestion: {user_request}"
+        messages = [
+            SystemMessage(content="You are an expert technical analyst. Use the provided context to answer the user's question precisely."),
+            HumanMessage(content=prompt)
+        ]
+
+    # 4. GENERATE ANSWER 
+    response = await llm.ainvoke(messages)
+    
     # --- THE TELEMETRY HOOK ---
-    # Log the exact data behind the scenes asynchronously to keep the UI fast
     log_rag_retrieval(
-        query=state["user_request"],
+        query=user_request,
         docs_with_scores=docs_with_scores,
         llm_response=response.content,
         repo_id=repo_to_check
     )
-    # --------------------------
     
+    # --- CONSOLIDATED SLACK CHAT ADAPTER HOOK ---
     chat_adapter = config["configurable"].get("chat_adapter")
     channel_id = config["configurable"].get("thread_id")
+    
     if chat_adapter and channel_id:
-        await chat_adapter.send_message(channel_id=channel_id, text=response.content)
+        image_urls = []
+        # Build the public GitHub URLs for Slack
+        for path in original_image_paths:
+            # Safely strip leading dots and slashes (e.g., ./app.png -> app.png)
+            clean_path = path.lstrip('./').lstrip('/')
+            image_urls.append(f"https://raw.githubusercontent.com/{repo_to_check}/main/{clean_path}")
+
+        # Execute a SINGLE send_message call
+        await chat_adapter.send_message(
+            channel_id=channel_id, 
+            text=response.content,
+            image_urls=image_urls # Passes empty list if no images, preventing Slack errors
+        )    
 
     return {"db_has_data": True}
-
 
 # --- NODE 3: GITHUB SEARCH ---
 async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
@@ -156,7 +322,7 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
         temperature=0, 
         base_url="http://localhost:11434/v1", 
         api_key="local-llm",
-        model="llama3.1" 
+        model=TEXT_MODEL 
     )
 
     prompt = ChatPromptTemplate.from_messages([

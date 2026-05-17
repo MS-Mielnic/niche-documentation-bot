@@ -4,7 +4,7 @@ from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings # Updated from community to dedicated package
 
 def get_vector_store(repo_id: str):
-    persist_directory = f"data/vector_db/{repo_id.replace('/', '_')}"
+    persist_directory = f"data/vector_db_v2/{repo_id.replace('/', '_')}"
     os.makedirs(persist_directory, exist_ok=True)
 
     embeddings = OllamaEmbeddings(
@@ -21,12 +21,12 @@ def get_vector_store(repo_id: str):
     return vector_db
 
 def check_if_repo_exists(repo_id: str) -> bool:
-    persist_directory = f"data/vector_db/{repo_id.replace('/', '_')}"
+    persist_directory = f"data/vector_db_v2/{repo_id.replace('/', '_')}"
     return os.path.exists(persist_directory) and len(os.listdir(persist_directory)) > 0
 
 def get_local_hash(repo_id: str) -> str | None:
     """Reads the last ingested commit hash for the JIT Sync."""
-    hash_path = f"data/vector_db/{repo_id.replace('/', '_')}/commit_hash.txt"
+    hash_path = f"data/vector_db_v2/{repo_id.replace('/', '_')}/commit_hash.txt"
     if os.path.exists(hash_path):
         with open(hash_path, "r") as f:
             return f.read().strip()
@@ -34,7 +34,7 @@ def get_local_hash(repo_id: str) -> str | None:
 
 def save_local_hash(repo_id: str, hash_val: str):
     """Saves the latest commit hash after a successful ingestion."""
-    persist_directory = f"data/vector_db/{repo_id.replace('/', '_')}"
+    persist_directory = f"data/vector_db_v2/{repo_id.replace('/', '_')}"
     os.makedirs(persist_directory, exist_ok=True)
     with open(f"{persist_directory}/commit_hash.txt", "w") as f:
         f.write(hash_val)

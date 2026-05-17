@@ -2,8 +2,8 @@
 from typing import Dict, Any
 from langgraph.graph import StateGraph, END
 
-from src.graph.state import AgentState
-from src.graph.nodes import (
+from src_v2.graph.state import AgentState
+from src_v2.graph.nodes import (
     classify_intent,
     check_chroma_db,
     search_github,

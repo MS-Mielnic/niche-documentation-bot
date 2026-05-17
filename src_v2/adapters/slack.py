@@ -1,6 +1,6 @@
-# src/adapters/slack.py
+# src_v2/adapters/slack.py
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
 import logging
@@ -22,11 +22,33 @@ class SlackAdapter(BaseChatAdapter):
             raise ValueError("SLACK_BOT_TOKEN must be provided or set in environment variables.")
         self.client = AsyncWebClient(token=token)
 
-    async def send_message(self, channel_id: str, text: str) -> Dict[str, Any]:
+    async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+        # 1. Base Block: The LLM's text response
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": text
+                }
+            }
+        ]
+
+        # 2. Dynamic Image Blocks: Append if vision triggered
+        if image_urls:
+            for i, url in enumerate(image_urls):
+                blocks.append({
+                    "type": "image",
+                    "image_url": url,
+                    "alt_text": f"Repository Visual Artifact {i+1}"
+                })
+
         try:
+            # 3. Execute the payload
             response = await self.client.chat_postMessage(
                 channel=channel_id,
-                text=text
+                text=text,     # Required fallback text for push notifications/mobile previews
+                blocks=blocks  # The rich UI layout
             )
             return response.data
         except SlackApiError as e:

@@ -1,5 +1,6 @@
-# src/main.py
+# src_v2/main.py
 import os
+import traceback
 import json
 import logging
 from fastapi import FastAPI, Request, BackgroundTasks, Form
@@ -12,8 +13,8 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 load_dotenv()
 
-from src.adapters.slack import SlackAdapter
-from src.graph.builder import build_graph
+from src_v2.adapters.slack import SlackAdapter
+from src_v2.graph.builder import build_graph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ async def process_slack_message(event: dict):
             logger.info("--- GRAPH EXECUTION PAUSED OR COMPLETED ---")
         except Exception as e:
             logger.error(f"Error executing graph: {e}")
+            print("🚨 DETAILED GRAPH CRASH TRACEBACK:")
+            traceback.print_exc()
 
 async def process_button_click(payload_json: str):
     """Handles interactive button clicks to resume the graph"""
