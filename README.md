@@ -71,4 +71,116 @@ niche-bot/
     └── rag/                          # Advanced Ingestion Pipeline
         ├── parent_store.py           # Disk Key-Value asset serialization framework 
         ├── vector_store.py           # Localized Chroma DB configuration using nomic-embed-text 
-        └── ingestion.py              # Structure-Aware parsing engine (Stateful Parsing & Regex) 
+        └── ingestion.py              # Structure-Aware parsing engine (Stateful Parsing & Regex)
+```
+
+        
+
+## Core Agent Architecture & Graph Orchestration
+
+NicheDocBot V2 is powered by a deterministic, cycle-permissible **LangGraph** state machine, replacing brittle linear LLM chains with structured runtime nodes and condition-driven routing paths. State durability is guaranteed via a pure, JSON-serializable `AgentState` schema anchored to an active `SqliteSaver` checkpointer database, allowing for seamless session recovery and non-blocking human-in-the-loop interaction gates. 
+
+Adhering strictly to a modular **Ports and Adapters (Hexagonal) architecture design**, the underlying engine is completely decoupled from individual messaging platforms. The codebase uses Dependency Injection to supply a generic `BaseChatAdapter` interface to graph nodes at execution runtime. The repository includes a production-ready Slack adaptation framework as its default UI context, but the boundaries layer can be effortlessly extended to support alternative frontends like Discord, Teams, or local WebSockets without mutating the underlying graph logic.
+
+### 🔄 The Execution Lifecycle Flow
+
+The diagram below conceptualizes the structural choreography of the agentic graph, tracking messages from ingress to response formulation:
+
+```text
+       [ Incoming Payload ]
+                 │
+                 ▼
+       ┌───────────────────┐
+       │ 1. Classification │ ──► (Determines user intent)
+       └───────────────────┘
+                 │
+                 ▼
+       ┌───────────────────┐
+       │   2. Hash Check   │ ──► [ Hashes Differ ] ──► ┌──────────────────────┐
+       └───────────────────┘                           │ 3. Immediate Ack /   │
+                 │                                     │    Background Sync   │
+         [ Hashes Match ]                              └──────────────────────┘
+                 │                                                 │
+                 ▼ ◄───────────────────────────────────────────────┘
+       ┌───────────────────┐
+       │  4. Interceptor   │ ──► (Extracts targeted Chroma row vectors &
+       └───────────────────┘      reconstructs complete Parent Blocks from Disk)
+                 │
+                 ▼
+       ┌───────────────────┐
+       │  5. Router Node   │
+       └───────────────────┘
+                 │
+         ┌───────┴───────┐
+         ▼               ▼
+   [ Text Route ]  [ Vision Route ]
+         │               │
+         ▼               ▼
+ ┌──────────────┐┌──────────────┐
+ │ 6. Text LLM  ││  7. Llama    │
+ │ (Llama 3.1)  ││  3.2-Vision  │
+ └──────────────┘└──────────────┘
+         │               │
+         └───────┬───────┘
+                 │
+                 ▼
+       ┌───────────────────┐
+       │   8. Wait for human Check   │ ──► [asynchronous user interaction and repository selection]
+       └───────────────────┘                                                   │
+                 │                                                             ▼
+          [ Ready / Clean ]                                        ┌────────────────────────┐
+                 │                                                 │  9. Process Override   │
+                 ▼                                                 └────────────────────────┘
+       ┌───────────────────┐                                                    │
+       │ 10. Agnostic Dispatch│ ◄───────────────────────────────────────────────┘
+       └───────────────────┘
+```
+---
+## Detailed Node Breakdown
+1. **Intent Classification (classify_intent_node)
+Objective:** Intercepts raw user text input and normalizes it into structural intent primitives to optimize downstream execution pathways.
+
+* **Logic:**  Employs an ultra-fast local LLM prompt map to evaluate whether the query represents a structural code/documentation question (KNOWLEDGE_QUERY), an active infrastructure state change request, or a general conversational element.
+
+2. **Just-In-Time Hash Check (jit_hash_check_node)
+Objective**: Determines if the locally cached vector databases are actively synchronized with the target remote repository state without triggering Slack webhook timeouts.
+
+* **Logic:** Issues an explicit HEAD request to fetch the remote repository's latest commit hash (~100ms processing footprint).If hashes match, the graph proceeds immediately to the context compilation layer.
+If hashes differ, it diverges to the Immediate Acknowledgment / Background Sync Loop.
+
+3. **Immediate Acknowledgment & Background Ingestion (throttled_ingestion_node)
+Objective:** Mitigates Slack's strict 3-second response window by decoupling HTTP network requests from local heavy indexing processing loops.
+
+* **Logic:** Returns an instantaneous HTTP 200 OK handshake string frame to Slack while deploying an isolated background asynchronous worker. The worker prints tracking logs to the user interface ("Hold on, I see new documentation..."), clones the changes, applies the custom stateful regex parser to extract text blocks, and commits updated parent block indices into storage.
+
+4. **The Vision & Layout Interceptor (interceptor_node)
+Objective:** Resolves the severe structural text-splitting context fragmentation found in Version 1.
+
+* **Logic:** Performs a tight mathematical vector distance search over the local ChromaDB schema. Instead of forwarding character-split strings directly to the generation model, the Interceptor inspects chunk metadata. If it encounters a structural pointer (such as an individual row from a complex Markdown matrix), it accesses the local disk-backed Key-Value store to inject the entire unadulterated parent block layout back into context before synthesis.
+
+5. **Dynamic Routing Gate (routing_router_node)
+Objective:** Routes data based on the underlying media configuration types discovered within the parsed context assets.
+
+* **Logic:** Evaluates file structure formats. If target documents consist exclusively of narrative Markdown or text strings, it maps requests directly to the standard generation node. If the query uncovers code visual flowcharts, wireframe paths, architectural assets, or binary image types, it routes the payload to the Vision node.
+
+6. **Text Synthesis Node (text_generation_node)
+Objective:** Generates concise analytical answers from clean text payloads.
+
+* **Logic:** Processes questions using local context via Llama 3.1, applying strict system prompts to prevent hallucinations.
+
+7. **Multimodal Vision Node (vision_reasoning_node)
+Objective:** Interprets media, graphs, formatting layouts, and user interface pixel architectures.
+
+* **Logic:** Compiles uncorrupted binary byte streams derived from the repository, transforms them into standardized Base64 string models, and maps them to Llama 3.2-Vision. This allows the system to visually inspect actual file designs, flow charts, or layout diagrams.
+
+8. **Asynchronous UI Synchronization (`wait_for_human_node`) Objective:** Manages asynchronous user interaction and repository selection without causing thread blocks or infinite retry loops.
+* **Logic:** When the graph requires explicit user guidance (such as selecting a target repository from a list or confirming a follow-up query path), the node interrupts the active LangGraph execution thread. It serializes the current `AgentState` to the SQLite checkpointer database, renders interactive choice components directly into the Slack UI, and completely halts execution. The graph remains safely suspended until the user interacts with the UI, which re-activates the state machine via the `/slack/interactions` gateway.
+
+9. **State Execution Override (process_override_node)
+Objective:** Translates human button interactions back into actionable state structures.
+
+* **Logic:** Consumes the human workspace decision payload, applies input corrections, overwrites target state variables, and updates execution vectors to route the model smoothly back to dispatch.
+
+10. **Unified Interface Dispatch Node (`prompt_for_query` Output Cycle)
+Objective:** Dispatches finalized content blocks and dynamic multi-media attachments back to the originating client window while remaining completely decoupled from specific frontend platforms.
+* **Logic:** The node accesses a generic `chat_adapter` instance provided dynamically at runtime via LangGraph's `RunnableConfig` dictionary. It compiles the local text response strings and arrays of raw media asset paths into standardized payloads. It then executes a single polymorphic connection method call (`await chat_adapter.send_message(...)`), delegating platform-specific formatting conversion tasks (e.g., Slack Blocks, Discord Markdown, or custom WebSocket JSON formats) entirely to the boundaries layer.
