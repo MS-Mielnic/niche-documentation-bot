@@ -29,21 +29,29 @@ async def process_slack_message(event: dict):
         
     user_id = event["user"]
     text = event["text"]
-    channel = event["channel"]
+    channel = event["channel"]  # This is the raw Slack Channel ID
     
     if "bot_id" in event:
         return
 
-    logger.info(f"Processing message from {user_id} in {channel}: '{text}'")
+    # Extract timestamps
+    message_ts = event.get("ts")
+    thread_ts = event.get("thread_ts", message_ts)
+    langgraph_thread_id = f"{channel}_{thread_ts}"
 
+    logger.info(f"Processing message from {user_id} in {channel} (Thread: {langgraph_thread_id}): '{text}'")
+
+    # 🎯 THIS INITIAL STATE NOW MATCHES THE NEW AGENTSTATE SCHEMA
     initial_state = {
         "user_request": text,
-        "thread_id": channel
+        "thread_id": langgraph_thread_id,
+        "channel_id": channel,   # Raw ID for Slack API
+        "thread_ts": thread_ts    # Used for threading replies
     }
 
     config = {
         "configurable": {
-            "thread_id": channel, 
+            "thread_id": langgraph_thread_id, 
             "chat_adapter": slack_adapter
         }
     }
@@ -52,49 +60,57 @@ async def process_slack_message(event: dict):
 
     async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
         agent_app = build_graph(memory)
-        logger.info("--- WAKING UP LANGGRAPH (NEW MESSAGE) ---")
+        print(f"--- WAKING UP LANGGRAPH (THREAD: {langgraph_thread_id}) ---")
         try:
+            # When you invoke, LangGraph will validate this dictionary against your TypedDict
             await agent_app.ainvoke(initial_state, config=config)
-            logger.info("--- GRAPH EXECUTION PAUSED OR COMPLETED ---")
+            logger.info("--- GRAPH EXECUTION COMPLETED ---")
         except Exception as e:
             logger.error(f"Error executing graph: {e}")
-            print("🚨 DETAILED GRAPH CRASH TRACEBACK:")
             traceback.print_exc()
 
-async def process_button_click(payload_json: str):
-    """Handles interactive button clicks to resume the graph"""
-    # Slack sends the payload as a JSON string, so we must parse it
-    data = json.loads(payload_json)
-    
-    channel = data["channel"]["id"]
-    user_id = data["user"]["id"]
-    
-    # Extract the specific repo the user clicked
-    actions = data.get("actions", [])
-    if not actions:
-        return
-        
-    selected_repo = actions[0].get("value")
-    logger.info(f"--- HUMAN SELECTED REPO: {selected_repo} ---")
 
-    config = {
-        "configurable": {
-            "thread_id": channel, 
-            "chat_adapter": slack_adapter
+async def process_button_click(payload_str: str):
+    """Handles interactive Block Kit button clicks"""
+    try:
+        payload_dict = json.loads(payload_str)
+        
+        actions = payload_dict.get("actions", [])
+        if not actions:
+            return
+            
+        selected_repo = actions[0].get("value")
+        
+        # 🎯 NEW THREAD LOGIC: Reconstruct the LangGraph thread ID from the button's context
+        container = payload_dict.get("container", {})
+        channel = container.get("channel_id")
+        message_ts = container.get("message_ts")
+        thread_ts = container.get("thread_ts", message_ts)
+        langgraph_thread_id = f"{channel}_{thread_ts}"
+
+        # Configure the checkpointer to resume this specific thread
+        config = {
+            "configurable": {
+                "thread_id": langgraph_thread_id,
+                "chat_adapter": slack_adapter
+            }
         }
-    }
 
-    # Open the database and resume the exact thread
-    async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
-        agent_app = build_graph(memory)
-        
-        logger.info(f"--- RESUMING LANGGRAPH FOR THREAD {channel} ---")
-        try:
-            # Command(resume=value) officially answers the interrupt() in Node 4
-            await agent_app.ainvoke(Command(resume=selected_repo), config=config)
-            logger.info("--- GRAPH EXECUTION COMPLETED (NODE 5 FINISHED) ---")
-        except Exception as e:
-            logger.error(f"Error resuming graph: {e}")
+        os.makedirs("data", exist_ok=True)
+
+        async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
+            agent_app = build_graph(memory)
+            
+            logger.info(f"--- RESUMING LANGGRAPH FOR THREAD {langgraph_thread_id} ---")
+            try:
+                # Command(resume=value) officially answers the interrupt() in Node 4
+                await agent_app.ainvoke(Command(resume=selected_repo), config=config)
+                logger.info("--- GRAPH EXECUTION COMPLETED (NODE 5 FINISHED) ---")
+            except Exception as e:
+                logger.error(f"Error resuming graph: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error processing button payload: {e}")
 
 @app.post("/slack/events")
 async def slack_events(request: Request, background_tasks: BackgroundTasks):

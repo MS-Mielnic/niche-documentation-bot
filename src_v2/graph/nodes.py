@@ -108,10 +108,13 @@ def route_after_db_check(state: AgentState) -> str:
 async def reply_to_greeting(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     print("--- NODE: REPLY TO GREETING ---")
     chat_adapter = config["configurable"].get("chat_adapter")
-    channel_id = config["configurable"].get("thread_id")
+    channel_id = state.get("channel_id")
+    thread_ts = state.get("thread_ts")
+
     if chat_adapter and channel_id:
         await chat_adapter.send_message(
-            channel_id=channel_id, 
+            channel_id=channel_id,
+            thread_ts =thread_ts, 
             text="Hello! I am ready to help you search or ingest GitHub repositories. What do you need?"
         )
     return {}
@@ -317,7 +320,8 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     log_rag_retrieval(query=user_request, docs_with_scores=docs_with_scores, llm_response=response.content, repo_id=repo_to_check)
     
     chat_adapter = config["configurable"].get("chat_adapter")
-    channel_id = config["configurable"].get("thread_id")
+    channel_id = state.get("channel_id")
+    thread_ts = state.get("thread_ts")
     
     if chat_adapter and channel_id:
         image_urls = []
@@ -327,6 +331,7 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
 
         await chat_adapter.send_message(
             channel_id=channel_id, 
+            thread_ts = thread_ts,
             text=response.content,
             image_urls=image_urls 
         )    
@@ -360,7 +365,9 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
     repos = await client.search_repositories(query=search_query, limit=3)
     
     chat_adapter = config["configurable"].get("chat_adapter")
-    channel_id = config["configurable"].get("thread_id")
+    channel_id = state.get("channel_id")
+    thread_ts = state.get("thread_ts")
+
 
     # Handle No Repos Found Cleanly
     if not repos:
@@ -368,6 +375,7 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
                 channel_id=channel_id, 
+                thread_ts=thread_ts,
                 text=f"I couldn't find any repositories matching '{search_query}'."
             )
         return {"repo_options": []} 
@@ -375,14 +383,20 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
     # Format options and SEND THE SLACK MESSAGE HERE (Before Node 4)
     options = [repo['full_name'] for repo in repos]
     print(f"--- FORMATTED OPTIONS: {options} ---")
+
+    # 🎯 DEBUG: Let's see exactly what's failing the check
+    print(f"--- DEBUG: chat_adapter={chat_adapter}, channel_id={channel_id} ---")
     
     if chat_adapter and channel_id:
         print(f"--- SENDING SLACK BUTTONS TO CHANNEL: {channel_id} ---")
         await chat_adapter.ask_for_human_approval(
             channel_id=channel_id,
+            thread_ts=thread_ts,
             text="I found these repositories. Which one should I ingest?",
-            options=options
+            repo_options=options
         )
+    else:
+        print("--- CRITICAL: CANNOT SEND BUTTONS, ADAPTER OR CHANNEL MISSING ---")
 
     return {"repo_options": options}
 
@@ -418,7 +432,9 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     print(f"--- NODE 5: STARTING JIT SYNC FOR '{selected_repo}' ---")
     
     chat_adapter = config["configurable"].get("chat_adapter")
-    channel_id = config["configurable"].get("thread_id")
+    channel_id = state.get("channel_id")
+    thread_ts = state.get("thread_ts")
+
 
     # 🚨 DEBUG LOG: Prove if LangGraph lost the adapter during the "sleep" phase
     print(f"--- DEBUG: Is chat_adapter present after waking up? {chat_adapter is not None} ---")
@@ -432,7 +448,8 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
         print(f"--- JIT MATCH: '{selected_repo}' is already up to date (Hash: {latest_hash}). Skipping ingestion. ---")
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
-                channel_id=channel_id, 
+                channel_id=channel_id,
+                thread_ts=thread_ts, 
                 text=f"✅ `{selected_repo}` is already completely up to date with the latest GitHub commit.\n *You can now ask me technical questions about this repository*"
             )
         return {"db_has_data": True}
@@ -450,6 +467,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
         # Capture the response dict from Slack
         response_data = await chat_adapter.send_message(
             channel_id=channel_id, 
+            thread_ts=thread_ts,
             text=msg_text
         )
         
@@ -463,21 +481,33 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
             repo_id=selected_repo, 
             chat_adapter=chat_adapter, 
             channel_id=channel_id,
-            message_id=message_id 
+            message_id=message_id,
+            thread_ts=thread_ts 
         )
         
         if success:
             # 3. SAVE THE NEW HASH ON SUCCESS
             if latest_hash:
                 save_local_hash(selected_repo, latest_hash)
+            # 🎯 INSTRUMENTED DEBUG BLOCK
+            print(f"--- DEBUG: Attempting to send success message ---")
+            print(f"--- DEBUG DATA: chat_adapter={chat_adapter}, channel_id={channel_id}, thread_ts={thread_ts} ---")
                 
             if chat_adapter and channel_id:
                 # We can send this as a new message, or theoretically update the progress 
                 # message to "Done". Sending a new message provides a nice final notification.
-                await chat_adapter.send_message(
-                    channel_id=channel_id, 
-                    text=f"✅ Done! I've fully synced `{selected_repo}`. You can now ask me technical questions about it."
-                )
+                try:
+                    await chat_adapter.send_message(
+                        channel_id=channel_id, 
+                        thread_ts=thread_ts,
+                        text=f"✅ Done! I've fully synced `{selected_repo}`. You can now ask me technical questions about it."
+                    )
+                    print("--- DEBUG: Success message sent successfully! ---")
+                except Exception as e:
+                    print(f"--- CRITICAL ERROR: send_message failed: {str(e)} ---")
+                    traceback.print_exc()
+        else:
+            print(f"--- CRITICAL: Could not send message. Adapter={chat_adapter}, Channel={channel_id} ---")
         return {"db_has_data": True}
         
     except Exception as e:
@@ -485,6 +515,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
                 channel_id=channel_id, 
+                thread_ts=thread_ts,
                 text=f"❌ Sorry, something went wrong during ingestion: {e}"
             )
         return {"db_has_data": False}

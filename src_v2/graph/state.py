@@ -12,3 +12,5 @@ class AgentState(TypedDict):
     db_has_data: bool          
     repo_options: List[str]    
     selected_repo: Optional[str]
+    channel_id: str
+    thread_ts: str

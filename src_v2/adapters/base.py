@@ -9,9 +9,9 @@ class BaseChatAdapter(ABC):
     """
 
     @abstractmethod
-    async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None, thread_ts: Optional[str] = None) -> Dict[str, Any]:
         """
-        Send a standard text message to the user/channel. 
+        Send a standard text message to the user/channel/thread
         Optionally supports rendering a list of image URLs inline.
         """
         pass
@@ -32,7 +32,7 @@ class BaseChatAdapter(ABC):
         pass
 
     @abstractmethod
-    async def ask_for_human_approval(self, channel_id: str, text: str, options: List[str]) -> Dict[str, Any]:
+    async def ask_for_human_approval(self, channel_id: str, repo_options: list, thread_ts: Optional[str] = None, text: str = "Please make a selection") -> Dict[str, Any]:      
         """
         Send a message with interactive elements (e.g., buttons or dropdowns)
         to pause the graph and request human input (HITL).

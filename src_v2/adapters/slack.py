@@ -21,7 +21,8 @@ class SlackAdapter(BaseChatAdapter):
         self.client = AsyncWebClient(token=token)
 
     # --- FUNCTION 1: SEND MESSAGE ---
-    async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None, thread_ts: Optional[str] = None) -> Dict[str, Any]:
+        print(f"--- DEBUG: SlackAdapter sending to channel={channel_id}, thread_ts={thread_ts} ---")
         try:
             blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
             
@@ -36,6 +37,7 @@ class SlackAdapter(BaseChatAdapter):
             # Send the message and DISABLE Slack's bulky link previews
             response = await self.client.chat_postMessage(
                 channel=channel_id,
+                thread_ts=thread_ts,
                 text=text, # Fallback text
                 blocks=blocks,
                 unfurl_links=False,  # <-- THIS FIXES THE SPAMMY PREVIEWS
@@ -47,7 +49,7 @@ class SlackAdapter(BaseChatAdapter):
             return {}
 
     # --- FUNCTION 2: UPDATE MESSAGE ---
-    async def update_message(self, channel_id: str, message_id: str, text: str) -> Dict[str, Any]:
+    async def update_message(self, channel_id: str, message_id: str, text: str, thread_ts=None) -> Dict[str, Any]:
         """
         Updates an existing Slack message using its timestamp (message_id).
         """
@@ -64,6 +66,7 @@ class SlackAdapter(BaseChatAdapter):
         try:
             response = await self.client.chat_update(
                 channel=channel_id,
+                thread_ts=thread_ts,
                 ts=message_id, # Slack uses 'ts' as the unique message identifier
                 text=text,     # Fallback text
                 blocks=blocks,
@@ -79,7 +82,7 @@ class SlackAdapter(BaseChatAdapter):
     async def send_typing_indicator(self, channel_id: str) -> None:
         pass
 
-    async def ask_for_human_approval(self, channel_id: str, text: str, options: List[str]) -> Dict[str, Any]:
+    async def ask_for_human_approval(self, channel_id: str, repo_options: list, thread_ts: Optional[str] = None, text: str = "Please, make a selection:") -> Dict[str, Any]:
         blocks = [
             {
                 "type": "section",
@@ -100,7 +103,7 @@ class SlackAdapter(BaseChatAdapter):
                         },
                         "value": option,
                         "action_id": f"select_{option.lower().replace(' ', '_')}"
-                    } for option in options
+                    } for option in repo_options
                 ]
             }
         ]
@@ -109,7 +112,8 @@ class SlackAdapter(BaseChatAdapter):
             response = await self.client.chat_postMessage(
                 channel=channel_id,
                 text="Please select an option.", # Fallback text
-                blocks=blocks
+                blocks=blocks,
+                thread_ts=thread_ts,
             )
             return response.data
         except SlackApiError as e:

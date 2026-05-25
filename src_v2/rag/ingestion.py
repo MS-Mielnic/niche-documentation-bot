@@ -11,7 +11,8 @@ from src_v2.rag.vector_store import get_vector_store
 from src_v2.rag.parent_store import save_parent
 
 
-async def ingest_repository(repo_id: str, chat_adapter=None, channel_id=None, message_id=None):
+async def ingest_repository(repo_id: str, chat_adapter=None, channel_id=None, thread_ts=None, message_id=None):
+    print(f"--- DEBUG: Ingesting into channel={channel_id}, thread={thread_ts} ---")
     client = GitHubClient()
     vector_db = get_vector_store(repo_id)
     
@@ -45,7 +46,7 @@ async def ingest_repository(repo_id: str, chat_adapter=None, channel_id=None, me
                 progress_text = f"⏳ Syncing `{repo_id}`: *{percentage}%* ({processed_files}/{total_files} files)\n_Currently reading: `{file_path}`_"
                 
                 try:
-                    await chat_adapter.update_message(channel_id, message_id, progress_text)
+                    await chat_adapter.update_message(channel_id, thread_ts,message_id, progress_text)
                 except Exception as e:
                     print(f"⚠️ Non-fatal: Failed to update Slack progress message: {e}")
 
