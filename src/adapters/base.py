@@ -29,3 +29,13 @@ class BaseChatAdapter(ABC):
         to pause the graph and request human input (HITL).
         """
         pass
+
+
+    @abstractmethod
+    def get_formatting_constraints(self) -> str:
+        """
+        Returns platform-specific instructions for the LLM's system prompt.
+        (e.g., 'Do not use markdown tables', 'Use bolding for headers', etc.)
+        """
+        pass
+

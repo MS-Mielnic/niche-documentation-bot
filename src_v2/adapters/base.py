@@ -15,6 +15,14 @@ class BaseChatAdapter(ABC):
         Optionally supports rendering a list of image URLs inline.
         """
         pass
+    
+    @abstractmethod
+    async def update_message(self, channel_id: str, message_id: str, text: str) -> Dict[str, Any]:
+        """
+        Update an existing message in the chat interface.
+        Used for real-time progress indicators without spamming the channel.
+        """
+        pass
 
     @abstractmethod
     async def send_typing_indicator(self, channel_id: str) -> None:
@@ -30,3 +38,13 @@ class BaseChatAdapter(ABC):
         to pause the graph and request human input (HITL).
         """
         pass
+
+    @abstractmethod
+    def get_formatting_constraints(self) -> str:
+        """
+        Returns platform-specific instructions for the LLM's system prompt.
+        (e.g., 'Do not use markdown tables', 'Use bolding for headers', etc.)
+        """
+        pass
+
+    # ... [Keep your existing abstract methods like send_message, etc.] ...

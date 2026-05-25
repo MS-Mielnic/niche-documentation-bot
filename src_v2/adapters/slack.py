@@ -5,7 +5,6 @@ from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
 import logging
 
-# Ensure you configure your logger appropriately in src/core/logger.py later
 logger = logging.getLogger(__name__)
 
 from .base import BaseChatAdapter
@@ -16,14 +15,42 @@ class SlackAdapter(BaseChatAdapter):
     """
     
     def __init__(self, bot_token: str = None):
-        # Fallback to environment variable if not passed explicitly
         token = bot_token or os.getenv("SLACK_BOT_TOKEN")
         if not token:
             raise ValueError("SLACK_BOT_TOKEN must be provided or set in environment variables.")
         self.client = AsyncWebClient(token=token)
 
+    # --- FUNCTION 1: SEND MESSAGE ---
     async def send_message(self, channel_id: str, text: str, image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
-        # 1. Base Block: The LLM's text response
+        try:
+            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+            
+            if image_urls:
+                for url in image_urls:
+                    blocks.append({
+                        "type": "image",
+                        "image_url": url,
+                        "alt_text": "Reference Image"
+                    })
+
+            # Send the message and DISABLE Slack's bulky link previews
+            response = await self.client.chat_postMessage(
+                channel=channel_id,
+                text=text, # Fallback text
+                blocks=blocks,
+                unfurl_links=False,  # <-- THIS FIXES THE SPAMMY PREVIEWS
+                unfurl_media=False   # <-- THIS STOPS MEDIA CARDS
+            )
+            return response.data
+        except SlackApiError as e:
+            print(f"Error sending message to Slack: {e}")
+            return {}
+
+    # --- FUNCTION 2: UPDATE MESSAGE ---
+    async def update_message(self, channel_id: str, message_id: str, text: str) -> Dict[str, Any]:
+        """
+        Updates an existing Slack message using its timestamp (message_id).
+        """
         blocks = [
             {
                 "type": "section",
@@ -34,36 +61,25 @@ class SlackAdapter(BaseChatAdapter):
             }
         ]
 
-        # 2. Dynamic Image Blocks: Append if vision triggered
-        if image_urls:
-            for i, url in enumerate(image_urls):
-                blocks.append({
-                    "type": "image",
-                    "image_url": url,
-                    "alt_text": f"Repository Visual Artifact {i+1}"
-                })
-
         try:
-            # 3. Execute the payload
-            response = await self.client.chat_postMessage(
+            response = await self.client.chat_update(
                 channel=channel_id,
-                text=text,     # Required fallback text for push notifications/mobile previews
-                blocks=blocks  # The rich UI layout
+                ts=message_id, # Slack uses 'ts' as the unique message identifier
+                text=text,     # Fallback text
+                blocks=blocks,
+                unfurl_links=False,
+                unfurl_media=False
             )
             return response.data
         except SlackApiError as e:
-            logger.error(f"Error sending message to Slack: {e.response['error']}")
-            raise
+            logger.error(f"Error updating message in Slack: {e.response['error']}")
+            raise    
 
+    # --- FUNCTION 3 & 4: OTHER ADAPTER METHODS ---
     async def send_typing_indicator(self, channel_id: str) -> None:
-        # Note: Slack's async typing indicator requires the Events API/Socket Mode,
-        # but you can simulate it or rely on their built-in event mechanisms depending on your setup.
         pass
 
     async def ask_for_human_approval(self, channel_id: str, text: str, options: List[str]) -> Dict[str, Any]:
-        """
-        Constructs a Slack Block Kit message with buttons for the user to select an option.
-        """
         blocks = [
             {
                 "type": "section",
@@ -99,3 +115,13 @@ class SlackAdapter(BaseChatAdapter):
         except SlackApiError as e:
             logger.error(f"Error sending approval blocks to Slack: {e.response['error']}")
             raise
+    
+    def get_formatting_constraints(self) -> str:
+        return """
+        CRITICAL UI FORMATTING RULES:
+        1. You are outputting to Slack, which DOES NOT support Markdown tables. 
+        2. If the context contains table data, YOU MUST smoothly integrate it into a clean, readable list of bullet points (e.g., • **[Name]**: [Data]).
+        3. NEVER output raw markdown tables using `|` characters.
+        4. NEVER announce that you are reformatting a table or converting a list. Just provide the answer natively and naturally.
+        5. Hide all internal RAG plumbing (e.g., '--- RECONSTRUCTED TABLE ---') from the user.
+        """

@@ -116,199 +116,219 @@ async def reply_to_greeting(state: AgentState, config: RunnableConfig) -> Dict[s
         )
     return {}
 
-# --- NODE 2: THE VISION INTERCEPTOR ---
+# --- NODE 2: THE UNIVERSAL INTERCEPTOR ---
+import re
+
+# ... [Keep your existing imports at the top of nodes.py] ...
+
 async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Node 2 (V2): The Vision Interceptor.
-    Retrieves narrative text chunks, intercepts section-bounded structural anchors 
-    (images & directory trees) via metadata keys, restores them from the Heavy Store,
-    and dynamically configures payloads for Llama 3.1 or 3.2-Vision.
+    Node 2 (V3): The Hybrid Interceptor.
+    Leverages Token Hot-Swapping, Proximity Cascading, and Sniper Catching to 
+    guarantee 100% structural fidelity of heavy Markdown elements at query time.
     """
-    print("--- NODE 2: PERFORMING MULTIMODAL VECTOR SEARCH & ANSWERING ---")
+    print("--- NODE 2: PERFORMING HYBRID MULTIMODAL VECTOR SEARCH ---")
     
     user_request = state["user_request"]
     repo_to_check = state.get("selected_repo") or user_request
     
     vector_db = get_vector_store(repo_to_check)
-    
     docs_with_scores = vector_db.similarity_search_with_score(user_request, k=6)
     
+    
+    # --- TEMPORARY RAW DATA DUMP ---
+    print("\n--- RAW CHROMA RETRIEVAL DATA ---")
+    for i, (doc, score) in enumerate(docs_with_scores):
+        print(f"\n[Chunk {i+1} | Score: {score:.4f}]")
+        print(f"Metadata: {doc.metadata}")
+        print(f"Content snippet: {doc.page_content[:200]}...")
+    print("---------------------------------\n")
+
+
+
+    # 1. INITIALIZE VARIABLES & BUCKETS (Top of prompt_for_query)
     context_text = []
+    
+    # These are the final arrays the routing logic will use
     vision_images = []
     original_image_paths = [] 
-    retrieved_tree_blocks = []
     
-    # 1. THE INTERCEPTOR LOOP
+    # --- NEW: BUCKETS FOR HIERARCHY PRUNING ---
+    specific_vision_images = []
+    specific_image_paths = []
+    root_vision_images = []
+    root_image_paths = []
+    
+    retrieved_structural_blocks = set() 
+
+    # 2. THE MAIN CHROMA LOOP
     for doc, score in docs_with_scores:
-        metadata = doc.metadata
-        source = metadata.get("source", "Unknown")
+        meta = doc.metadata
+        element_type = meta.get("element_type", "text")
+        raw_content = doc.page_content
+        source = meta.get("source", "Unknown")
 
-        # 🚨 TEMPORARY DATA DIAGNOSTIC LOGS (PRESERVED) 🚨
-        print("====== CHROMA METADATA DUMP ======")
-        print(f"Content Snippet: {doc.page_content[:50]}...")
-        print(f"Full Metadata Dict: {metadata}")
-        print(f"Raw 'image_path' from DB: {metadata.get('image_path')}")
-        print(f"Raw 'source' from DB: {metadata.get('source')}")
-        print("==================================")
+        print(f"====== INTERCEPTOR HOOK: {element_type.upper()} ======")
 
-        # Standard Operation: Always append the direct page content retrieved
-        context_text.append(f"Source: {source}\n{doc.page_content}")
+        # [Keep your MECH 1 Sniper Catch here if you still have it]
+        # ...
 
-        # 🎯 FIX: ANCHOR TYPE A - DETECT ADJACENT INLINE SECTION IMAGES
-        # Stamped right onto narrative text chunks by your stateful ingestion loop
-        image_path = metadata.get("image_path")
-        image_parent_id = metadata.get("parent_id")
-        element_type = metadata.get("element_type", "text")
-        
-        # Branch 1: Extracted via text chunk metadata pointer (Contextual Sync)
-        # --- Inside Node 2 Loop ---
-        # --- Inside src_v2/graph/nodes.py -> Node 2 Interceptor Loop ---
-        if image_path and image_parent_id:
-            if image_path not in original_image_paths:
-                
-                # 🎯 NEW: SEMANTIC CONTEXT GATE
-                # Extract the section header name (e.g., "## How the Backend Agent Works")
-                section_title = metadata.get("section", "").lower()
-                user_query = user_request.lower()
-                
-                # Clean up filenames for string matching (e.g., "agent.png" -> "agent")
-                image_keyword = image_path.split('.')[0].replace('_', ' ').replace('-', ' ')
-                
-                # CRITICAL VERIFICATION: Only load the image if the user is asking about 
-                # words in the section header, OR if the query mentions the image filename context directly.
-                # This perfectly blocks global 'app.png' from sneaking into a specific backend agent query!
-                is_relevant_section = any(word in user_query for word in section_title.split() if len(word) > 3)
-                is_explicit_image_request = any(kw in user_query for kw in image_keyword.split())
-                
-                if is_relevant_section or is_explicit_image_request or "root document" not in section_title:
-                    parent_data = get_parent(repo_to_check, image_parent_id)
-                    if parent_data:
-                        print(f"🎯 Interceptor Approved Relevant Image: {image_path} (Section: {metadata.get('section')})")
-                        
-                        # Extract and sanitize your base64 string completely
-                        raw_content = parent_data if isinstance(parent_data, str) else parent_data.get("content", "")
-                        clean_b64 = str(raw_content).strip().replace("\n", "").replace("\r", "")
-                        
-                        if not clean_b64.startswith("data:image/"):
-                            clean_b64 = f"data:image/png;base64,{clean_b64}"
-                            
-                        vision_images.append(clean_b64)
-                        original_image_paths.append(image_path)
-                        
-                        alt_text = parent_data.get("alt_text", "Diagram") if isinstance(parent_data, dict) else "Diagram"
-                        context_text.append(f"[System Note: Relevant engineering diagram '{alt_text}' has been provided for this topic segment.]")
-                else:
-                    print(f"🚫 Interceptor Filtered Out Unrelated Image: {image_path} (Belongs to section '{metadata.get('section')}', not contextually relevant to query.)")
+        # 🎯 MECH 2 & 3: TEXT CHUNKS (Token Hot-Swap & Proximity Catch)
+        if element_type == "text":
+            processed_content = raw_content
 
-        # Branch 2: Legacy fallback if Chroma returns the raw standalone image token document itself
-        elif element_type == "image" and image_parent_id:
-            parent_data = get_parent(repo_to_check, image_parent_id)
-            if parent_data:
-                print(f"👁️ Interceptor: Loading Raw Standalone Image Document ({image_parent_id})")
-                vision_images.append(parent_data["content"])
-                fallback_path = metadata.get("image_path", "unknown_asset.png")
-                if fallback_path not in original_image_paths:
-                    original_image_paths.append(fallback_path)
-
-        # 🎯 FIX: ANCHOR TYPE B - DETECT ADJACENT INLINE SECTION DIRECTORY TREES
-        tree_parent_id = metadata.get("tree_parent_id")
-        
-        # Branch 1: Extracted via text chunk metadata pointer (Contextual Sync)
-        if tree_parent_id:
-            if tree_parent_id not in retrieved_tree_blocks:
-                parent_data = get_parent(repo_to_check, tree_parent_id)
-                if parent_data:
-                    print(f"🌲 Interceptor: Restoring Contextual Directory Tree ({tree_parent_id}) via text chunk pointer.")
-                    retrieved_tree_blocks.append(tree_parent_id)
-                    context_text.append(f"--- RELEVANT SECTION REPOSITORY LAYOUT ---\n{parent_data['content']}\n-------------------")
-
-        # Branch 2: Legacy fallback if Chroma returns the raw standalone table/tree document rows
-        elif element_type in ["table", "tree"] and image_parent_id: # uses parent_id for standalone rows
-            parent_data = get_parent(repo_to_check, image_parent_id)
-            if parent_data and image_parent_id not in retrieved_tree_blocks:
-                print(f"🧩 Interceptor: Restoring Standalone Row {element_type} ({image_parent_id})")
-                retrieved_tree_blocks.append(image_parent_id)
-                context_text.append(f"--- FULL {element_type.upper()} ---")
-                context_text.append(parent_data["content"])
-                context_text.append("-------------------")
+            # A. The Token Hot-Swap (Spatial Integrity)
+            anchors = re.findall(r'\[\[RAG_(TABLE|TREE|IMAGE)_ANCHOR:\s*(.*?)\]\]', processed_content)
             
+            for anchor_type, parent_id in anchors:
+                if parent_id not in retrieved_structural_blocks:
+                    parent_data = get_parent(repo_to_check, parent_id)
+                    if parent_data:
+                        retrieved_structural_blocks.add(parent_id)
+                        
+                        if anchor_type == "IMAGE":
+                            # 🎯 INLINE IMAGES: Sort into Buckets!
+                            is_root = "root document" in meta.get("section", "root document").lower()
+                            
+                            img_b64 = parent_data.get("content", "")
+                            if not img_b64.startswith("data:image/"):
+                                img_b64 = f"data:image/png;base64,{img_b64}"
+                            
+                            target_path = parent_data.get("image_path") or meta.get("image_path", "unknown_asset.png")
+                            
+                            # Place in appropriate bucket based on hierarchy
+                            if is_root:
+                                if target_path not in root_image_paths:
+                                    root_image_paths.append(target_path)
+                                    root_vision_images.append(img_b64)
+                            else:
+                                if target_path not in specific_image_paths:
+                                    specific_image_paths.append(target_path)
+                                    specific_vision_images.append(img_b64)
+                                    print(f"✅ Interceptor loaded specific inline companion image: {target_path}")
+                            
+                            processed_content = processed_content.replace(
+                                f"[[RAG_IMAGE_ANCHOR: {parent_id}]]", 
+                                f"[System Note: Companion diagram '{parent_data.get('alt_text', 'Diagram')}' provided to vision model.]"
+                            )
+                        else:
+                            # Swap the text token with the actual raw Table/Tree data
+                            replacement = f"\n--- RECONSTRUCTED {anchor_type} ---\n{parent_data['content']}\n-------------------\n"
+                            processed_content = processed_content.replace(f"[[RAG_{anchor_type}_ANCHOR: {parent_id}]]", replacement)
+                else:
+                    processed_content = processed_content.replace(f"[[RAG_{anchor_type}_ANCHOR: {parent_id}]]", "")
+
+            # Append the beautifully reconstructed narrative chunk
+            context_text.append(f"Source: {source}\n{processed_content}")
+
+            # B. The Proximity Catch (Cascaded Section Metadata)
+            cascade_table_ids = meta.get("section_table_ids", "").split(",")
+            cascade_tree_id = meta.get("tree_parent_id")
+            cascade_image_id = meta.get("active_image_id")
+
+            proximity_ids = [tid for tid in cascade_table_ids if tid]
+            if cascade_tree_id: proximity_ids.append(cascade_tree_id)
+            if cascade_image_id: proximity_ids.append(cascade_image_id)
+
+            # Loop through proximity IDs
+            for p_id in proximity_ids:
+                if p_id and p_id not in retrieved_structural_blocks:
+                    parent_data = get_parent(repo_to_check, p_id)
+                    if parent_data:
+                        retrieved_structural_blocks.add(p_id)
+                        p_type = parent_data.get("element_type", "").upper()
+                        
+                        if p_type == "IMAGE":
+                            # 🎯 SECTION IMAGES: Sort into Buckets!
+                            is_root = "root document" in meta.get("section", "root document").lower()
+                            
+                            img_b64 = parent_data.get("content", "")
+                            if not img_b64.startswith("data:image/"):
+                                img_b64 = f"data:image/png;base64,{img_b64}"
+                                
+                            target_path = parent_data.get("image_path") or meta.get("image_path", "unknown_context_image.png")
+                            
+                            # Place in appropriate bucket based on hierarchy
+                            if is_root:
+                                if target_path not in root_image_paths:
+                                    root_image_paths.append(target_path)
+                                    root_vision_images.append(img_b64)
+                            else:
+                                if target_path not in specific_image_paths:
+                                    specific_image_paths.append(target_path)
+                                    specific_vision_images.append(img_b64)
+                                    print(f"✅ Interceptor loaded specific section companion image: {target_path}")
+                                    
+                            context_text.append(f"[System Note: Contextual section diagram '{target_path}' provided.]")
+                        else:
+                            context_text.append(f"--- CONTEXTUAL SECTION {p_type} ---\n{parent_data['content']}\n-------------------")
+
+    # =========================================================================
+    # 🎯 THE PRUNING GATE (Executes AFTER the entire vector search loop is done)
+    # =========================================================================
+    if specific_image_paths:
+        vision_images = specific_vision_images
+        original_image_paths = specific_image_paths
+        print(f"🎯 UI Focus: Specific diagrams found {original_image_paths}. Pruning root images.")
+    else:
+        vision_images = root_vision_images
+        original_image_paths = root_image_paths
+        if original_image_paths:
+            print(f"🌐 UI Focus: No specific diagrams found. Defaulting to root images {original_image_paths}.")
+
     full_context = "\n\n".join(context_text)
 
+    
     # 3. DYNAMIC MODEL ROUTING
+    chat_adapter = config["configurable"].get("chat_adapter")
+    
+    # Dynamically fetch UI constraints from the injected adapter
+    ui_constraints = chat_adapter.get_formatting_constraints() if chat_adapter else ""
+    
+    base_system_prompt = f"""You are an expert technical analyst. Use the provided context to answer the user's question precisely.
+    
+    {ui_constraints}
+    """
+
     if vision_images:
         print(f"🧠 ROUTING: Image detected. Invoking {VISION_MODEL}...")
-        llm = ChatOpenAI(
-            base_url="http://localhost:11434/v1",
-            api_key="local-llm",
-            model=VISION_MODEL,
-            temperature=0
-        )
+        llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="local-llm", model=VISION_MODEL, temperature=0)
         
-        # Structure payload cleanly for LangChain + Ollama OpenAI Endpoint Specs
         content_list = [{"type": "text", "text": f"Context:\n{full_context}\n\nQuestion: {user_request}"}]
-        
         for b64_uri in vision_images:
-            content_list.append({
-                "type": "image_url", 
-                "image_url": {
-                    "url": b64_uri  # Contains the validated 'data:image/png;base64,...' string
-                }
-            })
+            content_list.append({"type": "image_url", "image_url": {"url": b64_uri}})
             
         messages = [
-            SystemMessage(content="""You are an expert technical analyst with vision capabilities.
-            Use the provided text context and images to answer the user's question precisely.
-            
-            CRITICAL FORMATTING RULES:
-            1. Never mention or write out filenames like 'agent.png' or markdown image text.
-            2. Never output HTML tags like <img> or markdown images like ![](...) under any circumstances.
-            3. Do not tell the user an image has been provided or is shown below. Simply provide your raw technical explanation text."""),
+            SystemMessage(content=base_system_prompt),
             HumanMessage(content=content_list)
         ]
-        
     else:
-        print("⚡ ROUTING: Text only. Invoking Llama 3.1 (8B)...")
-        llm = ChatOpenAI(
-            base_url="http://localhost:11434/v1",
-            api_key="local-llm",
-            model=TEXT_MODEL,
-            temperature=0
-        )
-        
-        prompt = f"Use this context to answer:\n{full_context}\n\nQuestion: {user_request}"
+        print("⚡ ROUTING: Text only. Invoking Llama 3.1...")
+        llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="local-llm", model=TEXT_MODEL, temperature=0)
+        prompt = f"Context:\n{full_context}\n\nQuestion: {user_request}"
         messages = [
-            SystemMessage(content="You are an expert technical analyst. Use the provided context to answer the user's question precisely."),
+            SystemMessage(content=base_system_prompt),
             HumanMessage(content=prompt)
         ]
 
-    # 4. GENERATE ANSWER 
+    # 4. GENERATE ANSWER & DISPATCH
     response = await llm.ainvoke(messages)
     
-    # --- THE TELEMETRY HOOK ---
-    log_rag_retrieval(
-        query=user_request,
-        docs_with_scores=docs_with_scores,
-        llm_response=response.content,
-        repo_id=repo_to_check
-    )
+    log_rag_retrieval(query=user_request, docs_with_scores=docs_with_scores, llm_response=response.content, repo_id=repo_to_check)
     
-    # --- CONSOLIDATED SLACK CHAT ADAPTER HOOK ---
     chat_adapter = config["configurable"].get("chat_adapter")
     channel_id = config["configurable"].get("thread_id")
     
     if chat_adapter and channel_id:
         image_urls = []
-        # Build the public GitHub URLs for Slack
         for path in original_image_paths:
-            # Safely strip leading dots and slashes (e.g., ./app.png -> app.png)
             clean_path = path.lstrip('./').lstrip('/')
             image_urls.append(f"https://raw.githubusercontent.com/{repo_to_check}/main/{clean_path}")
 
-        # Execute a SINGLE send_message call
         await chat_adapter.send_message(
             channel_id=channel_id, 
             text=response.content,
-            image_urls=image_urls # Passes empty list if no images, preventing Slack errors
+            image_urls=image_urls 
         )    
 
     return {"db_has_data": True}
@@ -389,7 +409,6 @@ async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str,
     print(f"--- WAKING UP! HUMAN SELECTED: {user_selection} ---")
     return {"selected_repo": user_selection}
 
-
 # --- UPDATED NODE 5: TRUE JIT SYNC ENGINE ---
 async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     selected_repo = state.get("selected_repo")
@@ -400,6 +419,9 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     
     chat_adapter = config["configurable"].get("chat_adapter")
     channel_id = config["configurable"].get("thread_id")
+
+    # 🚨 DEBUG LOG: Prove if LangGraph lost the adapter during the "sleep" phase
+    print(f"--- DEBUG: Is chat_adapter present after waking up? {chat_adapter is not None} ---")
     
     # 1. THE JIT HASH CHECK
     client = GitHubClient()
@@ -411,19 +433,38 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
                 channel_id=channel_id, 
-                text=f"✅ `{selected_repo}` is already completely up to date with the latest GitHub commit."
+                text=f"✅ `{selected_repo}` is already completely up to date with the latest GitHub commit.\n *You can now ask me technical questions about this repository*"
             )
         return {"db_has_data": True}
     
     # 2. THE INGESTION ENGINE (Executes if new repo OR if hashes differ)
-    if chat_adapter and channel_id and local_hash:
-        await chat_adapter.send_message(
+    message_id = None # <-- NEW: Variable to hold our target message pointer
+    
+    if chat_adapter and channel_id:
+        # Better UX: Distinguish between an update and a first-time sync
+        if local_hash:
+            msg_text = f"🔄 I see new updates in `{selected_repo}`. Starting background sync..."
+        else:
+            msg_text = f"🚀 First time seeing `{selected_repo}`. Starting full ingestion..."
+            
+        # Capture the response dict from Slack
+        response_data = await chat_adapter.send_message(
             channel_id=channel_id, 
-            text=f"🔄 I see new updates in `{selected_repo}`. Starting background sync..."
+            text=msg_text
         )
+        
+        # Extract the Slack message timestamp ('ts') to use as our update pointer
+        if response_data:
+            message_id = response_data.get("ts")
 
     try:
-        success = await ingest_repository(repo_id=selected_repo, chat_adapter=chat_adapter, channel_id=channel_id)
+        # <-- NEW: Pass the message_id into the ingestion engine
+        success = await ingest_repository(
+            repo_id=selected_repo, 
+            chat_adapter=chat_adapter, 
+            channel_id=channel_id,
+            message_id=message_id 
+        )
         
         if success:
             # 3. SAVE THE NEW HASH ON SUCCESS
@@ -431,6 +472,8 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
                 save_local_hash(selected_repo, latest_hash)
                 
             if chat_adapter and channel_id:
+                # We can send this as a new message, or theoretically update the progress 
+                # message to "Done". Sending a new message provides a nice final notification.
                 await chat_adapter.send_message(
                     channel_id=channel_id, 
                     text=f"✅ Done! I've fully synced `{selected_repo}`. You can now ask me technical questions about it."
@@ -445,3 +488,9 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
                 text=f"❌ Sorry, something went wrong during ingestion: {e}"
             )
         return {"db_has_data": False}
+    
+
+
+
+
+  
