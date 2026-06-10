@@ -1,0 +1,26 @@
+#niche-bot/Dockerfile.simulator
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN useradd -m botuser
+
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    httpx \
+    opentelemetry-distro \
+    opentelemetry-exporter-otlp
+
+COPY src_v2/ src_v2/
+
+RUN chown -R botuser:botuser /app
+
+USER botuser
+
+ENV PATH=/home/botuser/.local/bin:$PATH
+ENV OTEL_SERVICE_NAME=nichedocbot-simulator
+
+EXPOSE 8080
+
+CMD ["opentelemetry-instrument", "python", "-m", "src_v2.observability.simulator"]

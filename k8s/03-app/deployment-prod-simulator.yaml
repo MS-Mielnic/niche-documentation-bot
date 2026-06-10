@@ -1,0 +1,93 @@
+#niche-bot/k8s/03-app/deployment-prod-simulator.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nichedocbot
+  labels:
+    app: nichedocbot
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: nichedocbot
+  template:
+    metadata:
+      labels:
+        app: nichedocbot
+    spec:
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "chown -R 1000:1000 /data"]
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+
+      containers:
+      - name: nichedocbot
+        image: nichedocbot:latest
+        imagePullPolicy: Never
+        env:
+        - name: SLACK_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: nichedocbot-secrets
+              key: SLACK_BOT_TOKEN
+
+        - name: GITHUB_PAT
+          valueFrom:
+            secretKeyRef:
+              name: nichedocbot-secrets
+              key: GITHUB_PAT
+
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector-service:4317"
+
+        - name: OTEL_SERVICE_NAME
+          value: "nichedocbot"
+
+        - name: OLLAMA_BASE_URL
+          value: "http://host.docker.internal:11434/v1"
+
+        - name: DATA_DIR
+          value: "/data"
+
+        - name: OLLAMA_EMBEDDINGS_BASE_URL
+          value: "http://192.168.254.178:11434"
+
+        - name: OLLAMA_EMBEDDINGS_MODEL
+          value: "nomic-embed-text:latest"
+
+        # Simulator mode:
+        # This app deployment uses SimulatorAdapter for outbound chat messages.
+        # The simulator deployment itself is defined in deployment-simulator.yaml.
+        - name: CHAT_ADAPTER
+          value: "simulator"
+
+        - name: SIMULATOR_WEBHOOK_URL
+          value: "http://nichedocbot-simulator:8080/webhook"
+
+        - name: APP_MODE
+          value: "simulator"
+
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+
+        volumeMounts:
+        - name: data-volume
+          mountPath: /data
+
+      volumes:
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: nichedocbot-data-pvc

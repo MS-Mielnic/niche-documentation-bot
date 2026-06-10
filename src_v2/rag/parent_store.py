@@ -2,10 +2,13 @@
 import os
 import json
 
+DATA_DIR = os.getenv("DATA_DIR", "data")
+VECTOR_DB_DIR = os.getenv("VECTOR_DB_DIR", os.path.join(DATA_DIR, "vector_db_v2"))
+
+
 def _get_parent_dir(repo_id: str) -> str:
-    """Helper to get the parent directory path for a specific repo."""
-    safe_repo_id = repo_id.replace('/', '_')
-    parent_dir = f"data/vector_db_v2/{safe_repo_id}/parents"
+    safe_repo_id = repo_id.replace("/", "_")
+    parent_dir = os.path.join(VECTOR_DB_DIR, safe_repo_id, "parents")
     os.makedirs(parent_dir, exist_ok=True)
     return parent_dir
 

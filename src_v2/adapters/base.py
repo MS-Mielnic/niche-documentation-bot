@@ -17,7 +17,8 @@ class BaseChatAdapter(ABC):
         pass
     
     @abstractmethod
-    async def update_message(self, channel_id: str, message_id: str, text: str) -> Dict[str, Any]:
+    async def update_message(self,channel_id: str,message_id: str,text: str,thread_ts: Optional[str] = None, blocks: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:       
         """
         Update an existing message in the chat interface.
         Used for real-time progress indicators without spamming the channel.
@@ -47,4 +48,16 @@ class BaseChatAdapter(ABC):
         """
         pass
 
-    # ... [Keep your existing abstract methods like send_message, etc.] ...
+    @abstractmethod
+    async def update_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+        thread_ts: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update an existing message in the chat interface.
+        Used for real-time progress indicators without spamming the channel.
+        """
+        pass

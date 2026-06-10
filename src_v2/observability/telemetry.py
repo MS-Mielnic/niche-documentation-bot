@@ -1,15 +1,51 @@
+#src_v2/observability/telemetry.py
 import json
 import os
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from langchain_core.documents import Document
+from opentelemetry import trace
+
+
+
+#This tracer will be imported by your LangGraph nodes to create manual spans.
+tracer = trace.get_tracer("nichedocbot.tracer")
+
+def add_retrieved_document_events(
+    span,
+    docs_with_scores: List[Tuple[Document, float]],
+) -> None:
+    """
+    Add one OpenTelemetry span event per retrieved document.
+
+    This provides per-document retrieval visibility without storing full
+    document content in traces.
+    """
+    if not span or not docs_with_scores:
+        return
+
+    for index, (doc, score) in enumerate(docs_with_scores):
+        metadata = doc.metadata or {}
+        content = doc.page_content or ""
+
+        span.add_event(
+            "retrieved_document",
+            {
+                "rag.document_index": index,
+                "rag.source": metadata.get("source", "unknown"),
+                "rag.element_type": metadata.get("element_type", "unknown"),
+                "rag.distance_score": float(score),
+                "rag.content_preview_length": len(content[:250]),
+            },
+        )
 
 def log_rag_retrieval(query: str, docs_with_scores: List[Tuple[Document, float]], llm_response: str, repo_id: str):
     """
     Logs RAG retrieval metrics to a local JSONL file for analysis.
     Every line is a valid JSON object, making it easy to parse in Pandas or Jupyter.
     """
-    log_dir = "data/telemetry"
+    data_dir = os.getenv("DATA_DIR", "data")
+    log_dir = os.path.join(data_dir, "telemetry")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "rag_logs.jsonl")
 

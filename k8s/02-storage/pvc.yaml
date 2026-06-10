@@ -1,0 +1,15 @@
+# niche-bot/k8s/02-storage/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nichedocbot-data-pvc
+  labels:
+    app: nichedocbot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # Kind's default storage class automatically provisions the underlying volume
+  storageClassName: standard

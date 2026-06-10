@@ -1,0 +1,25 @@
+# niche-bot/k8s/01-cluster/kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  # The Control Plane (Manages the cluster and routing)
+  - role: control-plane
+    image: kindest/node:v1.30.0
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+      - containerPort: 8000
+        hostPort: 8000
+        protocol: TCP
+        
+  # Worker Node 1 (Where application pods will be scheduled)
+  - role: worker
+    image: kindest/node:v1.30.0
+    
+  # Worker Node 2 (Ensures we can test distributed pod behavior)
+  - role: worker
+    image: kindest/node:v1.30.0

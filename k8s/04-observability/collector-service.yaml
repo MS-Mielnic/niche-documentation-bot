@@ -1,0 +1,19 @@
+#niche-bot/k8s/04-observability/collector-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-service
+  labels:
+    app: opentelemetry
+spec:
+  ports:
+    - name: grpc-otlp
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: http-otlp
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+  selector:
+    app: opentelemetry  

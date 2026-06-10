@@ -1,0 +1,16 @@
+#k8s/03-app/service-simulator.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: nichedocbot-simulator
+  labels:
+    app: nichedocbot-simulator
+spec:
+  type: ClusterIP
+  selector:
+    app: nichedocbot-simulator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

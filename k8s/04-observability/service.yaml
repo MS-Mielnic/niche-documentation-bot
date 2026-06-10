@@ -1,0 +1,12 @@
+#niche-bot/k8s/04-observability/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nichedocbot
+spec:
+  selector:
+    app: nichedocbot
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000

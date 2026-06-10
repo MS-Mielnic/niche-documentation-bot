@@ -1,5 +1,6 @@
 # src_v2/main.py
 import os
+import re
 import traceback
 import json
 import logging
@@ -11,63 +12,140 @@ from dotenv import load_dotenv
 from langgraph.types import Command 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-load_dotenv()
+from src_v2.observability.telemetry import tracer
+from opentelemetry import trace
+
 
 from src_v2.adapters.slack import SlackAdapter
 from src_v2.graph.builder import build_graph
+
+from src_v2.adapters.simulator import SimulatorAdapter
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-slack_adapter = SlackAdapter()
+
+
+def build_chat_adapter():
+    adapter_name = os.getenv("CHAT_ADAPTER", "slack").strip().lower()
+
+    if adapter_name == "simulator":
+        logger.info("Using SimulatorAdapter for outbound chat messages")
+        return SimulatorAdapter()
+
+    if adapter_name == "slack":
+        logger.info("Using SlackAdapter for outbound chat messages")
+        return SlackAdapter()
+
+    raise ValueError(
+        f"Unsupported CHAT_ADAPTER={adapter_name!r}. "
+        "Expected 'slack' or 'simulator'."
+    )
+
+
+chat_adapter = build_chat_adapter()
+
+def _safe_preview(text: str, max_len: int = 120) -> str:
+    """
+    Return a short, single-line, sanitized preview for telemetry.
+
+    This avoids sending full Slack messages into traces while still making
+    traces useful for debugging request flow.
+    """
+    if not text:
+        return ""
+
+    preview = " ".join(text.split())
+
+    # Basic Slack mention redaction. Keeps telemetry readable without storing
+    # full user/channel references from the message body.
+    preview = re.sub(r"<@[A-Z0-9]+>", "<@user>", preview)
+    preview = re.sub(r"<#[A-Z0-9]+\|[^>]+>", "<#channel>", preview)
+
+    if len(preview) > max_len:
+        return preview[: max_len - 3] + "..."
+
+    return preview
+
+
+def _set_if_present(span, key: str, value):
+    """
+    Set a span attribute only when the value exists.
+
+    This keeps traces clean and avoids attributes with None values.
+    """
+    if value is not None:
+        span.set_attribute(key, value)
 
 async def process_slack_message(event: dict):
-    """Handles standard text messages"""
+    """Handles standard text messages."""
     if "user" not in event or "text" not in event:
         return
-        
+
     user_id = event["user"]
     text = event["text"]
-    channel = event["channel"]  # This is the raw Slack Channel ID
-    
+    channel = event["channel"]
+
     if "bot_id" in event:
         return
 
-    # Extract timestamps
     message_ts = event.get("ts")
     thread_ts = event.get("thread_ts", message_ts)
+    event_type = event.get("type")
     langgraph_thread_id = f"{channel}_{thread_ts}"
 
-    logger.info(f"Processing message from {user_id} in {channel} (Thread: {langgraph_thread_id}): '{text}'")
+    with tracer.start_as_current_span("slack.process_message") as span:
+        _set_if_present(span, "slack.channel_id", channel)
+        _set_if_present(span, "slack.thread_ts", thread_ts)
+        _set_if_present(span, "slack.user_id", user_id)
+        _set_if_present(span, "slack.event_type", event_type)
+        span.set_attribute("slack.message_length", len(text))
+        span.set_attribute("agent.thread_id", langgraph_thread_id)
+        span.set_attribute("agent.user_request_preview", _safe_preview(text))
 
-    # 🎯 THIS INITIAL STATE NOW MATCHES THE NEW AGENTSTATE SCHEMA
-    initial_state = {
-        "user_request": text,
-        "thread_id": langgraph_thread_id,
-        "channel_id": channel,   # Raw ID for Slack API
-        "thread_ts": thread_ts    # Used for threading replies
-    }
+        logger.info(
+            "Processing message from %s in %s (Thread: %s)",
+            user_id,
+            channel,
+            langgraph_thread_id,
+        )
 
-    config = {
-        "configurable": {
-            "thread_id": langgraph_thread_id, 
-            "chat_adapter": slack_adapter
+        initial_state = {
+            "user_request": text,
+            "thread_id": langgraph_thread_id,
+            "channel_id": channel,
+            "thread_ts": thread_ts,
+
+            # Telemetry/context enrichment for downstream spans.
+            "slack_user_id": user_id,
+            "slack_event_type": event_type,
+            "message_ts": message_ts,
+            "user_request_preview": _safe_preview(text),
         }
-    }
 
-    os.makedirs("data", exist_ok=True)
+        config = {
+            "configurable": {
+                "thread_id": langgraph_thread_id,
+                "chat_adapter": chat_adapter,
+            }
+        }
 
-    async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
-        agent_app = build_graph(memory)
-        print(f"--- WAKING UP LANGGRAPH (THREAD: {langgraph_thread_id}) ---")
-        try:
-            # When you invoke, LangGraph will validate this dictionary against your TypedDict
-            await agent_app.ainvoke(initial_state, config=config)
-            logger.info("--- GRAPH EXECUTION COMPLETED ---")
-        except Exception as e:
-            logger.error(f"Error executing graph: {e}")
-            traceback.print_exc()
+        os.makedirs("/data", exist_ok=True)
+
+        async with AsyncSqliteSaver.from_conn_string("/data/checkpoints.sqlite") as memory:
+            agent_app = build_graph(memory)
+            print(f"--- WAKING UP LANGGRAPH (THREAD: {langgraph_thread_id}) ---")
+            try:
+                await agent_app.ainvoke(initial_state, config=config)
+                logger.info("--- GRAPH EXECUTION COMPLETED ---")
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                logger.error(f"Error executing graph: {e}")
+                traceback.print_exc()
 
 
 async def process_button_click(payload_str: str):
@@ -92,13 +170,13 @@ async def process_button_click(payload_str: str):
         config = {
             "configurable": {
                 "thread_id": langgraph_thread_id,
-                "chat_adapter": slack_adapter
+                "chat_adapter": chat_adapter
             }
         }
 
-        os.makedirs("data", exist_ok=True)
+        os.makedirs("/data", exist_ok=True)
 
-        async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
+        async with AsyncSqliteSaver.from_conn_string("/data/checkpoints.sqlite") as memory:
             agent_app = build_graph(memory)
             
             logger.info(f"--- RESUMING LANGGRAPH FOR THREAD {langgraph_thread_id} ---")

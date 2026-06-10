@@ -1,5 +1,11 @@
 # src_v2/graph/nodes.py
-from src_v2.observability.telemetry import log_rag_retrieval
+# Add this near your other imports at the top
+from opentelemetry import trace
+from src_v2.observability.telemetry import (
+    tracer,
+    log_rag_retrieval,
+    add_retrieved_document_events,
+)
 from typing import Dict, Any
 from src_v2.rag.vector_store import get_local_hash, save_local_hash, get_vector_store, check_if_repo_exists
 from src_v2.rag.ingestion import ingest_repository
@@ -13,26 +19,67 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage 
 from langgraph.types import interrupt
 from src_v2.graph.state import AgentState
+import re
+import traceback
+import os
+import time
 
 
 # --- GLOBAL OLLAMA MODEL ALIASES ---
 # Aligned exactly with your local machine's 'ollama list' profiles
 TEXT_MODEL = "llama3.1:latest"
 VISION_MODEL = "llama3.2-vision:latest"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+def _approx_message_chars(messages) -> int:
+    """
+    Estimate prompt size in characters without storing prompt content in traces.
+
+    Supports both text-only messages and multimodal HumanMessage content lists.
+    """
+    total = 0
+
+    for message in messages:
+        content = getattr(message, "content", "")
+
+        if isinstance(content, str):
+            total += len(content)
+
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        total += len(item.get("text", ""))
+                    elif item.get("type") == "image_url":
+                        # Do not count or store base64 image content.
+                        # Count only the presence of an image as a small fixed marker.
+                        total += len("[image_url]")
+                else:
+                    total += len(str(item))
+
+        else:
+            total += len(str(content))
+
+    return total
 
 # --- NODE 0: INTENT CLASSIFICATION ---
+@tracer.start_as_current_span("node.classify_intent")
 def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Node 0: Analyzes the user's message and classifies their intent.
     This prevents expensive or unnecessary vector DB searches for simple greetings.
     """
+    current_span = trace.get_current_span()
+    current_span.set_attribute("llm.model_used", VISION_MODEL)
+
     user_request = state["user_request"]
 
     print(f"--- NODE 0: CLASSIFYING INTENT FOR: '{user_request}' ---")
 
     llm = ChatOpenAI(
         temperature=0, 
-        base_url="http://localhost:11434/v1", 
+        # This will now use the environment variable, or fall back to localhost if it's missing
+        base_url=OLLAMA_BASE_URL, 
         api_key="local-llm",
         model=VISION_MODEL
     )
@@ -64,19 +111,23 @@ def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
 
 
 # --- NODE 1: DATABASE CHECK ---
+@tracer.start_as_current_span("node.check_chroma_db")
 async def check_chroma_db(state: AgentState) -> Dict[str, Any]:
     """
-    Node 1: Real Database Check.
-    Checks if the requested repository documentation is already stored locally.
+    Node 1: Checks if the requested repository documentation is already stored locally.
     """
+    current_span = trace.get_current_span()
     print("--- NODE 1: CHECKING LOCAL CHROMA DB ---")
     
     repo_to_check = state.get("selected_repo") or state.get("user_request")
     
     if not repo_to_check:
+        current_span.set_attribute("db.check_skipped", True)
         return {"db_has_data": False}
 
+    current_span.set_attribute("db.repo_checked", repo_to_check)
     exists = check_if_repo_exists(repo_id=repo_to_check)
+    current_span.set_attribute("db.found", exists)
     
     if exists:
         print(f"--- DATABASE FOUND FOR: {repo_to_check} ---")
@@ -105,10 +156,17 @@ def route_after_db_check(state: AgentState) -> str:
 
 
 # --- NEW NODE: REPLY TO GREETING ---
+@tracer.start_as_current_span("node.reply_to_greeting")
 async def reply_to_greeting(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
+    # We grab the current span to allow for potential future attribute tagging
+    # (e.g., if we want to track which channel_id was greeted)
+    current_span = trace.get_current_span()
+
     print("--- NODE: REPLY TO GREETING ---")
     chat_adapter = config["configurable"].get("chat_adapter")
     channel_id = state.get("channel_id")
+    if channel_id:
+        current_span.set_attribute("slack.channel_id", channel_id)
     thread_ts = state.get("thread_ts")
 
     if chat_adapter and channel_id:
@@ -119,11 +177,9 @@ async def reply_to_greeting(state: AgentState, config: RunnableConfig) -> Dict[s
         )
     return {}
 
-# --- NODE 2: THE UNIVERSAL INTERCEPTOR ---
-import re
+# --- NODE 2 ---
 
-# ... [Keep your existing imports at the top of nodes.py] ...
-
+@tracer.start_as_current_span("node.prompt_for_query")
 async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Node 2 (V3): The Hybrid Interceptor.
@@ -131,13 +187,19 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     guarantee 100% structural fidelity of heavy Markdown elements at query time.
     """
     print("--- NODE 2: PERFORMING HYBRID MULTIMODAL VECTOR SEARCH ---")
-    
+    # Grab the current span so we can attach RAG data to it
+    current_span = trace.get_current_span()
+
     user_request = state["user_request"]
     repo_to_check = state.get("selected_repo") or user_request
     
     vector_db = get_vector_store(repo_to_check)
     docs_with_scores = vector_db.similarity_search_with_score(user_request, k=6)
     
+    add_retrieved_document_events(
+        span=current_span,
+        docs_with_scores=docs_with_scores,
+    )
     
     # --- TEMPORARY RAW DATA DUMP ---
     print("\n--- RAW CHROMA RETRIEVAL DATA ---")
@@ -173,8 +235,6 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
 
         print(f"====== INTERCEPTOR HOOK: {element_type.upper()} ======")
 
-        # [Keep your MECH 1 Sniper Catch here if you still have it]
-        # ...
 
         # 🎯 MECH 2 & 3: TEXT CHUNKS (Token Hot-Swap & Proximity Catch)
         if element_type == "text":
@@ -280,7 +340,18 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
             print(f"🌐 UI Focus: No specific diagrams found. Defaulting to root images {original_image_paths}.")
 
     full_context = "\n\n".join(context_text)
-
+    
+    #tracing span and rags metrics ################
+    # Attach retrieval metrics to the span
+    current_span.set_attribute("rag.query", user_request)
+    current_span.set_attribute("rag.repo_target", repo_to_check)
+    current_span.set_attribute("rag.retrieved_chunks_count", len(docs_with_scores))
+    
+    # If chunks were found, record the best score to monitor retrieval drift over time
+    if docs_with_scores:
+        best_score = float(docs_with_scores[0][1])
+        current_span.set_attribute("rag.best_distance_score", best_score)
+    ###################    
     
     # 3. DYNAMIC MODEL ROUTING
     chat_adapter = config["configurable"].get("chat_adapter")
@@ -295,7 +366,15 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
 
     if vision_images:
         print(f"🧠 ROUTING: Image detected. Invoking {VISION_MODEL}...")
-        llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="local-llm", model=VISION_MODEL, temperature=0)
+        current_span.set_attribute("llm.model_used", VISION_MODEL)
+        current_span.set_attribute("llm.is_multimodal", True)
+        llm = ChatOpenAI(
+                temperature=0, 
+                # This will now use the environment variable, or fall back to localhost if it's missing
+                base_url=OLLAMA_BASE_URL, 
+                api_key="local-llm",
+                model=VISION_MODEL
+            )
         
         content_list = [{"type": "text", "text": f"Context:\n{full_context}\n\nQuestion: {user_request}"}]
         for b64_uri in vision_images:
@@ -307,7 +386,14 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
         ]
     else:
         print("⚡ ROUTING: Text only. Invoking Llama 3.1...")
-        llm = ChatOpenAI(base_url="http://localhost:11434/v1", api_key="local-llm", model=TEXT_MODEL, temperature=0)
+        current_span.set_attribute("llm.model_used", TEXT_MODEL)
+        current_span.set_attribute("llm.is_multimodal", False)
+        llm = ChatOpenAI(
+            base_url=OLLAMA_BASE_URL,
+            api_key="local-llm", 
+            model=TEXT_MODEL, 
+            temperature=0
+            )
         prompt = f"Context:\n{full_context}\n\nQuestion: {user_request}"
         messages = [
             SystemMessage(content=base_system_prompt),
@@ -315,8 +401,20 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
         ]
 
     # 4. GENERATE ANSWER & DISPATCH
+    approx_prompt_chars = _approx_message_chars(messages)
+    current_span.set_attribute("llm.approx_prompt_chars", approx_prompt_chars)
+
+    llm_start = time.perf_counter()
     response = await llm.ainvoke(messages)
-    
+    llm_latency_ms = (time.perf_counter() - llm_start) * 1000
+
+    response_content = response.content or ""
+
+    current_span.set_attribute("llm.latency_ms", llm_latency_ms)
+    current_span.set_attribute("llm.approx_response_chars", len(response_content))
+
+    # Keep the existing field for backward compatibility with your current traces.
+    current_span.set_attribute("llm.response_length", len(response_content))
     log_rag_retrieval(query=user_request, docs_with_scores=docs_with_scores, llm_response=response.content, repo_id=repo_to_check)
     
     chat_adapter = config["configurable"].get("chat_adapter")
@@ -339,15 +437,20 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     return {"db_has_data": True}
 
 # --- NODE 3: GITHUB SEARCH ---
+@tracer.start_as_current_span("node.search_github")
 async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     print("--- NODE 3: SEARCHING GITHUB ---")
+
+    current_span = trace.get_current_span()
+    current_span.set_attribute("llm.model_used", TEXT_MODEL)
+
     user_request = state["user_request"]
     
     llm = ChatOpenAI(
-        temperature=0, 
-        base_url="http://localhost:11434/v1", 
-        api_key="local-llm",
-        model=TEXT_MODEL 
+        base_url=OLLAMA_BASE_URL,
+        api_key="local-llm", 
+        model=TEXT_MODEL, 
+        temperature=0
     )
 
     prompt = ChatPromptTemplate.from_messages([
@@ -402,34 +505,51 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
 
 
 # --- NODE 4: HUMAN IN THE LOOP ---
+@tracer.start_as_current_span("node.wait_for_human")
 async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Node 4: This node is now pure. It only pauses the graph. 
     When resumed, it will re-execute, but the interrupt will instantly return the user's selection 
     without causing any duplicate Slack messages.
     """
+    current_span = trace.get_current_span()
     print("--- NODE 4: WAITING FOR HUMAN APPROVAL ---")
     
     repo_options = state.get("repo_options", [])
+
+    # Capture how many options were presented as an attribute
+    current_span.set_attribute("hitl.options_count", len(repo_options))
     
     # If Node 3 found nothing, skip the pause entirely
     if not repo_options:
+        current_span.set_attribute("hitl.skipped", True)
         print("--- SKIPPING HITL: NO VALID REPOS ---")
         return {"selected_repo": None}
     
     # The graph goes to sleep here. On resume, this line grabs the clicked button value.
     user_selection = interrupt("Waiting for user to select a repository...")
+    # Upon resume, capture the selection
+    current_span.set_attribute("hitl.user_selection", str(user_selection))
     
     print(f"--- WAKING UP! HUMAN SELECTED: {user_selection} ---")
     return {"selected_repo": user_selection}
 
 # --- UPDATED NODE 5: TRUE JIT SYNC ENGINE ---
+@tracer.start_as_current_span("node.throttled_ingestion")
 async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
+
+    # 1. Grab the current span at the very beginning
+    current_span = trace.get_current_span()
+
     selected_repo = state.get("selected_repo")
     if not selected_repo:
+        current_span.set_attribute("ingestion.skipped", True)
         return {"db_has_data": False}
         
     print(f"--- NODE 5: STARTING JIT SYNC FOR '{selected_repo}' ---")
+
+    # 2. Attach the target repository to the span
+    current_span.set_attribute("ingestion.repo_target", selected_repo)
     
     chat_adapter = config["configurable"].get("chat_adapter")
     channel_id = state.get("channel_id")
@@ -444,8 +564,15 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     latest_hash = await client.get_latest_commit_hash(selected_repo)
     local_hash = get_local_hash(selected_repo)
 
+    if latest_hash:
+        current_span.set_attribute("ingestion.latest_hash", latest_hash)
+    if local_hash:
+        current_span.set_attribute("ingestion.local_hash", local_hash)
+
+
     if latest_hash and latest_hash == local_hash:
         print(f"--- JIT MATCH: '{selected_repo}' is already up to date (Hash: {latest_hash}). Skipping ingestion. ---")
+        current_span.set_attribute("ingestion.sync_required", False)
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
                 channel_id=channel_id,
@@ -453,6 +580,9 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
                 text=f"✅ `{selected_repo}` is already completely up to date with the latest GitHub commit.\n *You can now ask me technical questions about this repository*"
             )
         return {"db_has_data": True}
+    
+    # Mark that a full sync is initiating
+    current_span.set_attribute("ingestion.sync_required", True)
     
     # 2. THE INGESTION ENGINE (Executes if new repo OR if hashes differ)
     message_id = None # <-- NEW: Variable to hold our target message pointer
@@ -484,7 +614,8 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
             message_id=message_id,
             thread_ts=thread_ts 
         )
-        
+        #  Attach the ultimate success/fail status of the pipeline   
+        current_span.set_attribute("ingestion.success", success)
         if success:
             # 3. SAVE THE NEW HASH ON SUCCESS
             if latest_hash:
@@ -512,6 +643,13 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
         
     except Exception as e:
         print(f"--- INGESTION FAILED: {e} ---")
+        # Record the failure in your trace!
+        current_span.set_attribute("ingestion.success", False)
+        current_span.set_attribute("ingestion.error_message", str(e))
+        
+        # ADD THIS: Mark span as error in OTel
+        current_span.set_status(trace.Status(trace.StatusCode.ERROR)) 
+        
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
                 channel_id=channel_id, 

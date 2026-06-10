@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nichedocbot-simulator
+  labels:
+    app: nichedocbot-simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nichedocbot-simulator
+  template:
+    metadata:
+      labels:
+        app: nichedocbot-simulator
+    spec:
+      containers:
+      - name: nichedocbot-simulator
+        image: nichedocbot-simulator:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: BOT_EVENTS_URL
+          value: "http://nichedocbot:8000/slack/events"
+        - name: BOT_INTERACTIONS_URL
+          value: "http://nichedocbot:8000/slack/interactions"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector-service:4317"
+        - name: OTEL_SERVICE_NAME
+          value: "nichedocbot-simulator"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"

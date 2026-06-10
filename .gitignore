@@ -17,3 +17,7 @@ data/
 #Python
 __pycache__/
 
+
+# Local Kubernetes secrets
+k8s/03-app/secret.yaml
+*.secret.yaml

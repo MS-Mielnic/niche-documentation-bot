@@ -1,0 +1,16 @@
+#niche-bot/k8s/04-observability/load-generator.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nichedocbot-simulator
+spec:
+  template:
+    spec:
+      containers:
+      - name: simulator
+        image: nichedocbot-simulator:local
+        imagePullPolicy: Never
+        env:
+          - name: NICHE_BOT_API_URL
+            value: "http://nichedocbot:800"
+      restartPolicy: OnFailure
