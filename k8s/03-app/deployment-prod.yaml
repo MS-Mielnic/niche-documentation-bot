@@ -43,7 +43,10 @@ spec:
               name: nichedocbot-secrets
               key: GITHUB_PAT
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "http://otel-collector-service:4317"
+          valueFrom:
+            configMapKeyRef:
+              name: otel-routing-config
+              key: OTEL_EXPORTER_OTLP_ENDPOINT
         - name: OTEL_SERVICE_NAME
           value: "nichedocbot"
         - name: OLLAMA_BASE_URL  

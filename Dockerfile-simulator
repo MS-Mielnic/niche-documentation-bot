@@ -10,7 +10,9 @@ RUN pip install --no-cache-dir \
     uvicorn \
     httpx \
     opentelemetry-distro \
-    opentelemetry-exporter-otlp
+    opentelemetry-exporter-otlp \
+    opentelemetry-instrumentation-fastapi \
+    opentelemetry-instrumentation-httpx
 
 COPY src_v2/ src_v2/
 

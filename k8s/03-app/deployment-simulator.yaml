@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: nichedocbot-simulator
-        image: nichedocbot-simulator:latest
+        image: nichedocbot-simulator:otel-httpx-v1
         imagePullPolicy: Never
         ports:
         - containerPort: 8080
@@ -26,7 +26,10 @@ spec:
         - name: BOT_INTERACTIONS_URL
           value: "http://nichedocbot:8000/slack/interactions"
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: "http://otel-collector-service:4317"
+          valueFrom:
+            configMapKeyRef:
+              name: otel-routing-config
+              key: OTEL_EXPORTER_OTLP_ENDPOINT
         - name: OTEL_SERVICE_NAME
           value: "nichedocbot-simulator"
         resources:

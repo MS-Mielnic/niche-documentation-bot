@@ -1,0 +1,31 @@
+clusterName: nichedocbot-kind
+
+splunkObservability:
+  realm: us1
+  accessToken: "placeholder"
+
+secret:
+  create: false
+  name: splunk-otel-secret
+
+agent:
+  enabled: true
+  ports:
+    otlp:
+      hostPort: null
+    otlp-http:
+      hostPort: null
+
+clusterReceiver:
+  enabled: true
+
+gateway:
+  enabled: false
+
+logsEngine: otel
+
+logsCollection:
+  containers:
+    enabled: false
+
+environment: local-kind
