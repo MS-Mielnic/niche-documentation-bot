@@ -5,6 +5,8 @@ from src_v2.observability.telemetry import (
     tracer,
     log_rag_retrieval,
     add_retrieved_document_events,
+    record_rag_retrieval_metrics,
+    record_llm_metrics,
 )
 from typing import Dict, Any
 from src_v2.rag.vector_store import get_local_hash, save_local_hash, get_vector_store, check_if_repo_exists
@@ -70,6 +72,8 @@ def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
     This prevents expensive or unnecessary vector DB searches for simple greetings.
     """
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "intent_classification")
+    current_span.set_attribute("llm.model", VISION_MODEL)
     current_span.set_attribute("llm.model_used", VISION_MODEL)
 
     user_request = state["user_request"]
@@ -117,6 +121,7 @@ async def check_chroma_db(state: AgentState) -> Dict[str, Any]:
     Node 1: Checks if the requested repository documentation is already stored locally.
     """
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "knowledge_query")
     print("--- NODE 1: CHECKING LOCAL CHROMA DB ---")
     
     repo_to_check = state.get("selected_repo") or state.get("user_request")
@@ -125,8 +130,10 @@ async def check_chroma_db(state: AgentState) -> Dict[str, Any]:
         current_span.set_attribute("db.check_skipped", True)
         return {"db_has_data": False}
 
+    current_span.set_attribute("rag.repo", repo_to_check)
     current_span.set_attribute("db.repo_checked", repo_to_check)
     exists = check_if_repo_exists(repo_id=repo_to_check)
+    current_span.set_attribute("rag.local_db_found", exists)
     current_span.set_attribute("db.found", exists)
     
     if exists:
@@ -161,6 +168,7 @@ async def reply_to_greeting(state: AgentState, config: RunnableConfig) -> Dict[s
     # We grab the current span to allow for potential future attribute tagging
     # (e.g., if we want to track which channel_id was greeted)
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "greeting")
 
     print("--- NODE: REPLY TO GREETING ---")
     chat_adapter = config["configurable"].get("chat_adapter")
@@ -189,12 +197,17 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     print("--- NODE 2: PERFORMING HYBRID MULTIMODAL VECTOR SEARCH ---")
     # Grab the current span so we can attach RAG data to it
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "rag_answer")
 
     user_request = state["user_request"]
     repo_to_check = state.get("selected_repo") or user_request
     
+    current_span.set_attribute("rag.repo", repo_to_check)
     vector_db = get_vector_store(repo_to_check)
+    retrieval_start = time.perf_counter()
     docs_with_scores = vector_db.similarity_search_with_score(user_request, k=6)
+    retrieval_duration_ms = (time.perf_counter() - retrieval_start) * 1000
+    current_span.set_attribute("rag.retrieval.duration_ms", retrieval_duration_ms)
     
     add_retrieved_document_events(
         span=current_span,
@@ -344,13 +357,25 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     #tracing span and rags metrics ################
     # Attach retrieval metrics to the span
     current_span.set_attribute("rag.query", user_request)
+    current_span.set_attribute("rag.repo", repo_to_check)
     current_span.set_attribute("rag.repo_target", repo_to_check)
+    current_span.set_attribute("rag.retrieval.chunk_count", len(docs_with_scores))
     current_span.set_attribute("rag.retrieved_chunks_count", len(docs_with_scores))
     
     # If chunks were found, record the best score to monitor retrieval drift over time
+    best_score = None
     if docs_with_scores:
         best_score = float(docs_with_scores[0][1])
+        current_span.set_attribute("rag.retrieval.top_score", best_score)
         current_span.set_attribute("rag.best_distance_score", best_score)
+
+    record_rag_retrieval_metrics(
+        repo_id=repo_to_check,
+        chunk_count=len(docs_with_scores),
+        duration_ms=retrieval_duration_ms,
+        top_score=best_score,
+        workflow_type="rag_answer",
+    )
     ###################    
     
     # 3. DYNAMIC MODEL ROUTING
@@ -366,6 +391,8 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
 
     if vision_images:
         print(f"🧠 ROUTING: Image detected. Invoking {VISION_MODEL}...")
+        selected_llm_model = VISION_MODEL
+        current_span.set_attribute("llm.model", VISION_MODEL)
         current_span.set_attribute("llm.model_used", VISION_MODEL)
         current_span.set_attribute("llm.is_multimodal", True)
         llm = ChatOpenAI(
@@ -386,6 +413,8 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
         ]
     else:
         print("⚡ ROUTING: Text only. Invoking Llama 3.1...")
+        selected_llm_model = TEXT_MODEL
+        current_span.set_attribute("llm.model", TEXT_MODEL)
         current_span.set_attribute("llm.model_used", TEXT_MODEL)
         current_span.set_attribute("llm.is_multimodal", False)
         llm = ChatOpenAI(
@@ -408,8 +437,44 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     response = await llm.ainvoke(messages)
     llm_latency_ms = (time.perf_counter() - llm_start) * 1000
 
+    usage_metadata = getattr(response, "usage_metadata", None) or {}
+    response_metadata = getattr(response, "response_metadata", None) or {}
+    token_usage = response_metadata.get("token_usage") or {}
+
+    prompt_tokens = (
+        usage_metadata.get("input_tokens")
+        or token_usage.get("prompt_tokens")
+    )
+    completion_tokens = (
+        usage_metadata.get("output_tokens")
+        or token_usage.get("completion_tokens")
+    )
+    total_tokens = (
+        usage_metadata.get("total_tokens")
+        or token_usage.get("total_tokens")
+    )
+
+    if prompt_tokens is not None:
+        current_span.set_attribute("llm.prompt_tokens", int(prompt_tokens))
+    if completion_tokens is not None:
+        current_span.set_attribute("llm.completion_tokens", int(completion_tokens))
+    if total_tokens is not None:
+        current_span.set_attribute("llm.total_tokens", int(total_tokens))
+
+    record_llm_metrics(
+        model=selected_llm_model,
+        duration_ms=llm_latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        is_multimodal=bool(vision_images),
+        repo_id=repo_to_check,
+        workflow_type="rag_answer",
+    )
+
     response_content = response.content or ""
 
+    current_span.set_attribute("llm.duration_ms", llm_latency_ms)
     current_span.set_attribute("llm.latency_ms", llm_latency_ms)
     current_span.set_attribute("llm.approx_response_chars", len(response_content))
 
@@ -442,6 +507,8 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
     print("--- NODE 3: SEARCHING GITHUB ---")
 
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "github_search")
+    current_span.set_attribute("llm.model", TEXT_MODEL)
     current_span.set_attribute("llm.model_used", TEXT_MODEL)
 
     user_request = state["user_request"]
@@ -513,6 +580,7 @@ async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str,
     without causing any duplicate Slack messages.
     """
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "human_approval")
     print("--- NODE 4: WAITING FOR HUMAN APPROVAL ---")
     
     repo_options = state.get("repo_options", [])
@@ -540,6 +608,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
 
     # 1. Grab the current span at the very beginning
     current_span = trace.get_current_span()
+    current_span.set_attribute("workflow.type", "repo_ingestion")
 
     selected_repo = state.get("selected_repo")
     if not selected_repo:
@@ -549,6 +618,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     print(f"--- NODE 5: STARTING JIT SYNC FOR '{selected_repo}' ---")
 
     # 2. Attach the target repository to the span
+    current_span.set_attribute("rag.repo", selected_repo)
     current_span.set_attribute("ingestion.repo_target", selected_repo)
     
     chat_adapter = config["configurable"].get("chat_adapter")
