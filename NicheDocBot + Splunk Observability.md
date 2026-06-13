@@ -326,3 +326,352 @@ Splunk Observability Cloud shows:
   - optional otel-trace-test
 
 Current state: successful.
+
+17. RAG and LLM telemetry enrichment
+
+Include:
+
+Trace attributes:
+workflow.type
+rag.repo
+rag.local_db_found
+rag.retrieval.chunk_count
+rag.retrieval.top_score
+rag.retrieval.duration_ms
+llm.model
+llm.is_multimodal
+llm.duration_ms
+llm.prompt_tokens
+llm.completion_tokens
+llm.total_tokens
+
+And:
+
+Custom metrics:
+rag.retrieval.duration_ms_*
+rag.retrieval.chunk_count_*
+rag.retrieval.top_score_*
+llm.duration_ms_*
+llm.prompt_tokens_*
+llm.completion_tokens_*
+llm.total_tokens_*
+
+Also include the Splunk histogram naming explanation:
+
+OpenTelemetry histograms appear in Splunk as:
+_sum
+_count
+_min
+_max
+_bucket
+
+And the correct build/load command:
+
+kind load docker-image nichedocbot:latest --name nichedocbot-cluster
+
+because we found that plain kind load docker-image nichedocbot:latest fails when the cluster is not named kind.
+
+
+## Troubleshooting: Splunk APM stops showing app services
+
+Use this section when Splunk APM stops showing `nichedocbot` or `nichedocbot-simulator`, or when it looks like no telemetry is reaching Splunk.
+
+### 1. First separate the possible failure points
+
+The telemetry path is:
+
+```text
+app / simulator → Splunk OTel Collector in Kubernetes → Splunk Observability Cloud
+```
+
+Do not assume the app is broken immediately. Check each part of the path.
+
+### 2. Verify the Splunk OTel Collector is running
+
+```bash
+kubectl get pods -n splunk-otel
+kubectl get svc -n splunk-otel
+helm status splunk-otel -n splunk-otel
+```
+
+Expected:
+
+```text
+splunk-otel-splunk-otel-collector-agent-*   1/1 Running
+splunk-otel-splunk-otel-collector-k8s-cluster-receiver-*   1/1 Running
+STATUS: deployed
+```
+
+### 3. Verify app and simulator point to the Splunk collector
+
+```bash
+kubectl exec deployment/nichedocbot -- printenv OTEL_EXPORTER_OTLP_ENDPOINT
+kubectl exec deployment/nichedocbot-simulator -- printenv OTEL_EXPORTER_OTLP_ENDPOINT
+```
+
+Expected:
+
+```text
+http://splunk-otel-splunk-otel-collector-agent.splunk-otel.svc.cluster.local:4317
+```
+
+### 4. Send a synthetic trace directly to the collector
+
+```bash
+TEST_SERVICE="otel-trace-test-$(date +%H%M%S)"
+
+echo "Testing service: $TEST_SERVICE"
+
+kubectl run "$TEST_SERVICE" \
+  --rm -i --restart=Never \
+  --namespace default \
+  --image=ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+  -- traces \
+  --otlp-endpoint splunk-otel-splunk-otel-collector-agent.splunk-otel.svc.cluster.local:4317 \
+  --otlp-insecure \
+  --traces 20 \
+  --service "$TEST_SERVICE"
+```
+
+Then search for the printed service name in Splunk APM using a “last 15 minutes” or “last 30 minutes” window.
+
+Interpretation:
+
+```text
+If the test service appears in Splunk:
+  Kubernetes → Splunk Collector → Splunk Cloud is working.
+
+If the test service does not appear:
+  Debug collector export, Splunk token, realm, or network egress.
+```
+
+### 5. Verify egress from Kubernetes to Splunk Cloud
+
+```bash
+kubectl run curl-splunk-ingest \
+  --rm -i --restart=Never \
+  --namespace default \
+  --image=curlimages/curl:latest \
+  -- sh -c 'date; curl -I -m 10 https://ingest.us1.observability.splunkcloud.com'
+```
+
+Expected:
+
+```text
+HTTP/2 404
+```
+
+A `404` is acceptable here because the root endpoint is not a real ingest API route. The important thing is that DNS, TLS, and outbound network access work.
+
+### 6. Check collector export errors
+
+```bash
+for pod in $(kubectl get pods -n splunk-otel -o name | grep 'collector-agent'); do
+  echo "===== $pod ====="
+  kubectl logs -n splunk-otel "$pod" --since=45m | \
+    grep -Ei "otelcol.signal.*trace|traces|otlphttp|splunk|signalfx|exporting failed|retry|timeout|deadline|unauthorized|forbidden|dropped" | \
+    tail -120
+done
+```
+
+Known non-blocking warnings in local Kind:
+
+```text
+kubeletstats TLS/IP SAN errors
+Prometheus kubernetes-proxy scrape warnings
+intermittent signalfx metrics export timeout warnings
+```
+
+These may affect infrastructure metrics, but they do not necessarily mean APM traces are broken.
+
+A metrics timeout looks like:
+
+```text
+otelcol.signal: "metrics"
+otelcol.component.id: "signalfx"
+Post "https://ingest.us1.observability.splunkcloud.com/v2/datapoint":
+Client.Timeout exceeded while awaiting headers
+```
+
+If this appears only for `metrics`, and synthetic traces still appear in Splunk, then trace export is working.
+
+### 7. Verify simulator image and runtime status
+
+Because the simulator uses a local Kind image tag, confirm the pod is running the expected image:
+
+```bash
+kubectl get pods
+kubectl get deployment nichedocbot-simulator -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl describe pod -l app=nichedocbot-simulator | grep -Ei "Image:|Image ID:|Pull|Failed|BackOff|Err"
+```
+
+Expected image:
+
+```text
+nichedocbot-simulator:otel-httpx-v1
+```
+
+If the image is missing after a rebuild or Kind reset:
+
+```bash
+docker images | grep nichedocbot-simulator
+kind load docker-image nichedocbot-simulator:otel-httpx-v1 --name nichedocbot-cluster
+kubectl rollout restart deployment/nichedocbot-simulator
+kubectl rollout status deployment/nichedocbot-simulator
+```
+
+### 8. Verify simulator is generating app traffic
+
+```bash
+kubectl logs deployment/nichedocbot-simulator --tail=150
+kubectl logs deployment/nichedocbot --tail=150
+```
+
+Look for app logs like:
+
+```text
+POST /slack/events HTTP/1.1" 200 OK
+POST /slack/interactions HTTP/1.1" 200 OK
+HTTP Request: POST http://nichedocbot-simulator:8080/webhook "HTTP/1.1 200 OK"
+```
+
+If the simulator is quiet, force new traffic:
+
+```bash
+kubectl rollout restart deployment/nichedocbot-simulator
+kubectl rollout status deployment/nichedocbot-simulator
+kubectl logs deployment/nichedocbot-simulator --tail=150 -f
+```
+
+### 9. Verify app instrumentation packages
+
+```bash
+kubectl exec -i deployment/nichedocbot -- python - <<'PY'
+mods = [
+    "opentelemetry.instrumentation.fastapi",
+    "opentelemetry.instrumentation.httpx",
+    "opentelemetry.instrumentation.sqlite3",
+]
+for m in mods:
+    try:
+        __import__(m)
+        print(f"OK {m}")
+    except Exception as e:
+        print(f"MISSING {m}: {e}")
+PY
+```
+
+Expected:
+
+```text
+OK opentelemetry.instrumentation.fastapi
+OK opentelemetry.instrumentation.httpx
+OK opentelemetry.instrumentation.sqlite3
+```
+
+### 10. Test trace export from inside the app pod
+
+```bash
+kubectl exec -i deployment/nichedocbot -- python - <<'PY'
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+import time
+import os
+
+endpoint = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"]
+print("endpoint:", endpoint)
+
+provider = TracerProvider(
+    resource=Resource.create({"service.name": "nichedocbot-app-pod-export-test"})
+)
+processor = BatchSpanProcessor(
+    OTLPSpanExporter(endpoint=endpoint, insecure=True)
+)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer("manual-test")
+with tracer.start_as_current_span("manual.app.pod.export.test") as span:
+    span.set_attribute("test.source", "nichedocbot-pod")
+    print("created span")
+
+provider.force_flush()
+time.sleep(2)
+provider.shutdown()
+print("done")
+PY
+```
+
+Then search Splunk APM for:
+
+```text
+nichedocbot-app-pod-export-test
+```
+
+Interpretation:
+
+```text
+If this appears in Splunk:
+  The app pod can export traces. The collector/Splunk path is working.
+
+If normal app traffic still does not appear:
+  Check whether the app is generating fresh traffic and whether the Splunk APM time window or filters are hiding the service.
+```
+
+### 11. Confirm direct app service reachability
+
+```bash
+kubectl run app-direct-test \
+  --rm -i --restart=Never \
+  --namespace default \
+  --image=curlimages/curl:latest \
+  -- sh -c 'curl -s -o /dev/null -w "%{http_code}\n" -X POST http://nichedocbot:8000/slack/events -H "Content-Type: application/json" -d "{}"'
+```
+
+Expected:
+
+```text
+200
+```
+
+### 12. Final interpretation from the June 11 debug session
+
+In the June 11 debug session, Splunk appeared to stop receiving app traces. The actual result was:
+
+```text
+Synthetic telemetrygen traces reached Splunk.
+The app pod could manually export traces.
+The simulator was running the correct image.
+The app was receiving simulator traffic.
+The app had FastAPI, HTTPX, and SQLite instrumentation installed.
+Splunk APM showed nichedocbot, nichedocbot-simulator, sqlite, GitHub, raw.githubusercontent.com, and Ollama/host.docker.internal after fresh traffic was generated.
+```
+
+Conclusion:
+
+```text
+Splunk APM trace ingestion was working.
+The missing services were caused by time-window/service-filter visibility and lack of fresh app traffic, not by a broken collector or bad simulator image.
+```
+
+Do not confuse examples such as:
+
+```text
+POST http://nichedocbot:8000/slack/events
+200 OK
+```
+
+with shell commands. Those are log patterns to look for, not commands to run.
+After adding it, run:
+
+git diff -- "NicheDocBot + Splunk Observability.md"
+
+Then commit it separately:
+
+git add "NicheDocBot + Splunk Observability.md"
+git commit -m "Update Splunk troubleshooting runbook"
+git push
+
