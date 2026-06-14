@@ -180,12 +180,14 @@ async def process_button_click(payload_str: str):
             agent_app = build_graph(memory)
             
             logger.info(f"--- RESUMING LANGGRAPH FOR THREAD {langgraph_thread_id} ---")
+            logger.info(f"--- BUTTON SELECTED REPO: {selected_repo} ---")
+
             try:
-                # Command(resume=value) officially answers the interrupt() in Node 4
+                # Command(resume=value) officially answers the interrupt() in Node 4.
                 await agent_app.ainvoke(Command(resume=selected_repo), config=config)
-                logger.info("--- GRAPH EXECUTION COMPLETED (NODE 5 FINISHED) ---")
+                logger.info("--- GRAPH RESUME COMPLETED ---")
             except Exception as e:
-                logger.error(f"Error resuming graph: {e}")
+                logger.error(f"Error resuming graph: {e}", exc_info=True)
                 
     except Exception as e:
         logger.error(f"Error processing button payload: {e}")

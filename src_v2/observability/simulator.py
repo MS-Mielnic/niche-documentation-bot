@@ -84,10 +84,12 @@ class SimulationState:
         # Maps a thread_ts to an asyncio Event that fires when a question is answered
         self.answer_events: Dict[str, asyncio.Event] = {}
         self.client = httpx.AsyncClient(timeout=30.0)
+        self.awaiting_answer: Dict[str, bool] = {}
 
     def register_thread(self, thread_ts: str):
         self.completion_events[thread_ts] = asyncio.Event()
-        self.answer_events[thread_ts] = asyncio.Event()    
+        self.answer_events[thread_ts] = asyncio.Event()
+        self.awaiting_answer[thread_ts] = False
 
     async def trigger_button_click(self, thread_ts: str, action_id: str, value: str):
         with tracer.start_as_current_span("simulator.trigger_button_click") as span:
@@ -194,6 +196,21 @@ async def receive_adapter_webhook(request: Request, background_tasks: Background
 
                     background_tasks.add_task(state.trigger_button_click, thread_ts, action_id, value)
                     return {"status": "interaction_triggered"}
+        # If this is a regular bot response in a registered thread,
+        # treat it as the answer to the current simulator question.
+        if text and thread_ts in state.answer_events and state.awaiting_answer.get(thread_ts):
+            logger.info(f"[{thread_ts}] Answer detected. Marking current question as answered.")
+            state.awaiting_answer[thread_ts] = False
+            state.answer_events[thread_ts].set()
+            return {"status": "answer_detected"}
+        
+        if text and thread_ts in state.answer_events:
+            logger.info(f"[{thread_ts}] Bot message received while not awaiting answer. Ignoring for answer tracking.")
+            return {"status": "bot_message_ignored_not_awaiting_answer"}
+
+
+        return {"status": "ignored"}
+
 # ==========================================
 # SCENARIO RUNNER (THE "BRAIN")
 # ==========================================
@@ -279,6 +296,7 @@ async def run_load_test():
                             question_span.set_attribute("simulator.question_length", len(question))
                             question_span.set_attribute("simulator.topic", topic)
 
+                            state.awaiting_answer[thread_ts] = True
                             await send_slack_message(thread_ts, question)
 
                             try:
