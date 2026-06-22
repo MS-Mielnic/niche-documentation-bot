@@ -679,7 +679,11 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
 
 
 # --- NODE 4: HUMAN IN THE LOOP ---
-@tracer.start_as_current_span("node.wait_for_human")
+@tracer.start_as_current_span(
+    "node.wait_for_human",
+    record_exception=False,
+    set_status_on_exception=False,
+)
 async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Node 4: This node is now pure. It only pauses the graph. 
@@ -727,6 +731,7 @@ async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str,
 
     # Normal path: the graph goes to sleep here. On resume, this line grabs
     # the clicked button value supplied by Command(resume=...).
+    current_span.set_attribute("hitl.interrupt_expected", True)
     user_selection = interrupt("Waiting for user to select a repository...")
 
     current_span.set_attribute("hitl.selection_source", "langgraph_interrupt_resume")
