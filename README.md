@@ -76,3 +76,6 @@ Prerequisites
 ```text
  uvicorn src_v2.main:app --reload --port 8000.
  ```
+### For the Kubernetes implementation
+
+Read the runbook at `k8s/03-app/README-runbook.md`.
