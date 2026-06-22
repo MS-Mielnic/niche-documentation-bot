@@ -18,6 +18,12 @@ from opentelemetry import trace
 
 from src_v2.adapters.slack import SlackAdapter
 from src_v2.graph.builder import build_graph
+from src_v2.graph.repo_workflow_store import (
+    record_selection_received,
+    claim_resume,
+    mark_resume_completed,
+    mark_resume_failed,
+)
 
 from src_v2.adapters.simulator import SimulatorAdapter
 
@@ -149,28 +155,52 @@ async def process_slack_message(event: dict):
 
 
 async def process_button_click(payload_str: str):
-    """Handles interactive Block Kit button clicks"""
+    """
+    Handles interactive Block Kit button clicks.
+
+    Durable coordination design:
+    - Always record the selected repo first.
+    - Resume LangGraph only if the graph is already paused at wait_for_human.
+    - If the click arrives early, leave the selection durably stored.
+      wait_for_human will consume it when the original graph reaches that node.
+    - Duplicate Slack/simulator retries are idempotent.
+    """
     try:
         payload_dict = json.loads(payload_str)
-        
+
         actions = payload_dict.get("actions", [])
         if not actions:
             return
-            
+
         selected_repo = actions[0].get("value")
-        
-        # 🎯 NEW THREAD LOGIC: Reconstruct the LangGraph thread ID from the button's context
+
         container = payload_dict.get("container", {})
         channel = container.get("channel_id")
         message_ts = container.get("message_ts")
         thread_ts = container.get("thread_ts", message_ts)
         langgraph_thread_id = f"{channel}_{thread_ts}"
 
-        # Configure the checkpointer to resume this specific thread
+        logger.info("--- BUTTON SELECTED REPO: %s ---", selected_repo)
+        logger.info("--- RECORDING SELECTION FOR THREAD %s ---", langgraph_thread_id)
+
+        selection_record = await record_selection_received(
+            thread_id=langgraph_thread_id,
+            selected_repo=selected_repo,
+            source="slack_interaction",
+        )
+
+        if not selection_record.get("ok"):
+            logger.warning(
+                "--- SELECTION REJECTED FOR THREAD %s: %s ---",
+                langgraph_thread_id,
+                selection_record,
+            )
+            return
+
         config = {
             "configurable": {
                 "thread_id": langgraph_thread_id,
-                "chat_adapter": chat_adapter
+                "chat_adapter": chat_adapter,
             }
         }
 
@@ -178,19 +208,41 @@ async def process_button_click(payload_str: str):
 
         async with AsyncSqliteSaver.from_conn_string("/data/checkpoints.sqlite") as memory:
             agent_app = build_graph(memory)
-            
-            logger.info(f"--- RESUMING LANGGRAPH FOR THREAD {langgraph_thread_id} ---")
-            logger.info(f"--- BUTTON SELECTED REPO: {selected_repo} ---")
+            checkpoint_state = await agent_app.aget_state(config)
+
+            logger.info(
+                "--- THREAD %s CHECKPOINT NEXT=%s AFTER SELECTION ---",
+                langgraph_thread_id,
+                checkpoint_state.next,
+            )
+
+            if not checkpoint_state.next or "wait_for_human" not in checkpoint_state.next:
+                logger.info(
+                    "--- THREAD %s IS NOT INTERRUPT-READY; SELECTION STORED FOR GRAPH TO CONSUME ---",
+                    langgraph_thread_id,
+                )
+                return
+
+            if not await claim_resume(langgraph_thread_id):
+                logger.info(
+                    "--- THREAD %s RESUME ALREADY CLAIMED OR COMPLETED; IGNORING DUPLICATE CLICK ---",
+                    langgraph_thread_id,
+                )
+                return
+
+            logger.info("--- RESUMING LANGGRAPH FOR THREAD %s ---", langgraph_thread_id)
 
             try:
-                # Command(resume=value) officially answers the interrupt() in Node 4.
                 await agent_app.ainvoke(Command(resume=selected_repo), config=config)
+                await mark_resume_completed(langgraph_thread_id)
                 logger.info("--- GRAPH RESUME COMPLETED ---")
             except Exception as e:
-                logger.error(f"Error resuming graph: {e}", exc_info=True)
-                
+                await mark_resume_failed(langgraph_thread_id, str(e))
+                logger.error("Error resuming graph: %s", e, exc_info=True)
+
     except Exception as e:
-        logger.error(f"Error processing button payload: {e}")
+        logger.error("Error processing button payload: %s", e, exc_info=True)
+
 
 @app.post("/slack/events")
 async def slack_events(request: Request, background_tasks: BackgroundTasks):

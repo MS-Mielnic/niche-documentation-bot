@@ -21,6 +21,11 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage 
 from langgraph.types import interrupt
 from src_v2.graph.state import AgentState
+from src_v2.graph.repo_workflow_store import (
+    record_selection_requested,
+    get_pending_selection,
+    mark_selection_consumed,
+)
 import re
 import traceback
 import os
@@ -554,6 +559,24 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
     options = [repo['full_name'] for repo in repos]
     print(f"--- FORMATTED OPTIONS: {options} ---")
 
+    thread_id = state.get("thread_id")
+
+    if thread_id:
+        workflow_record = await record_selection_requested(
+            thread_id=thread_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            repo_options=options,
+        )
+        current_span.set_attribute(
+            "repo_workflow.status",
+            workflow_record.get("status", "unknown"),
+        )
+        print(f"--- REPO WORKFLOW: selection requested for thread {thread_id} ---")
+    else:
+        current_span.set_attribute("repo_workflow.missing_thread_id", True)
+        print("--- WARNING: Cannot record repo workflow; missing thread_id ---")
+
     # 🎯 DEBUG: Let's see exactly what's failing the check
     print(f"--- DEBUG: chat_adapter={chat_adapter}, channel_id={channel_id} ---")
     
@@ -594,10 +617,43 @@ async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str,
         print("--- SKIPPING HITL: NO VALID REPOS ---")
         return {"selected_repo": None}
     
-    # The graph goes to sleep here. On resume, this line grabs the clicked button value.
+    thread_id = state.get("thread_id")
+
+    # If a Slack/simulator click arrived before LangGraph finished checkpointing
+    # this interrupt, consume that durable pending selection instead of sleeping.
+    if thread_id:
+        pending_selection = await get_pending_selection(thread_id)
+
+        if pending_selection:
+            if pending_selection in repo_options:
+                current_span.set_attribute("hitl.selection_source", "durable_pending_selection")
+                current_span.set_attribute("hitl.user_selection", pending_selection)
+                print(f"--- DURABLE HITL: CONSUMING PENDING SELECTION: {pending_selection} ---")
+
+                await mark_selection_consumed(
+                    thread_id=thread_id,
+                    selected_repo=pending_selection,
+                    consumed_by="wait_for_human_pending_selection",
+                )
+
+                return {"selected_repo": pending_selection}
+
+            current_span.set_attribute("hitl.invalid_pending_selection", str(pending_selection))
+            print(f"--- WARNING: Ignoring invalid pending selection: {pending_selection} ---")
+
+    # Normal path: the graph goes to sleep here. On resume, this line grabs
+    # the clicked button value supplied by Command(resume=...).
     user_selection = interrupt("Waiting for user to select a repository...")
-    # Upon resume, capture the selection
+
+    current_span.set_attribute("hitl.selection_source", "langgraph_interrupt_resume")
     current_span.set_attribute("hitl.user_selection", str(user_selection))
+
+    if thread_id:
+        await mark_selection_consumed(
+            thread_id=thread_id,
+            selected_repo=str(user_selection),
+            consumed_by="langgraph_interrupt_resume",
+        )
     
     print(f"--- WAKING UP! HUMAN SELECTED: {user_selection} ---")
     return {"selected_repo": user_selection}
