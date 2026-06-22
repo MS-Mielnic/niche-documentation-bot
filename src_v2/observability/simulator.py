@@ -49,12 +49,11 @@ TERMINAL_PHRASES = [
     "You can now ask me technical questions"
 ]
 
-# 10 test scenarios to generate rich telemetry (Splunk Dashboard data)
+# Test scenarios to generate rich telemetry (Splunk Dashboard data)
 
 
 TEST_SCENARIOS = [
     "pandas",
-    "kubernetes",
     "opentelemetry",
     "fastapi",
     "langgraph",
