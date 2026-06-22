@@ -3,12 +3,174 @@ import os
 import re
 import uuid
 import asyncio
+from html import unescape
+from urllib.parse import unquote, urlparse
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src_v2.mcp.github_client import GitHubClient
 from src_v2.rag.vector_store import get_vector_store
 from src_v2.rag.parent_store import save_parent
+
+SUPPORTED_REPO_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".bmp",
+    ".ico",
+    ".tif",
+    ".tiff",
+)
+
+UNSUPPORTED_REPO_MEDIA_EXTENSIONS = (
+    ".mp4",
+    ".webm",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".mp3",
+    ".wav",
+    ".pdf",
+)
+
+
+def _clean_image_reference(raw_path: str) -> str:
+    """
+    Clean Markdown/HTML image references without changing repo-relative meaning.
+    Removes URL query/fragment decorations and HTML escaping.
+    """
+    cleaned = unescape(raw_path or "").strip()
+
+    # Markdown also permits image paths like <docs/diagram.png>
+    if cleaned.startswith("<") and cleaned.endswith(">"):
+        cleaned = cleaned[1:-1].strip()
+
+    cleaned = cleaned.split("#", 1)[0].split("?", 1)[0].strip()
+    return cleaned
+
+
+def _has_unresolved_template_tokens(path: str) -> bool:
+    """
+    Detect unresolved site-template paths that are not real repo assets, for example:
+    {{ base_url }}static/img/logo.svg
+    {{ person.avatar_url }}
+    {% static 'img/logo.png' %}
+    """
+    return any(token in path for token in ("{{", "}}", "{%", "%}", "{#", "#}", "${"))
+
+
+def _has_supported_image_extension(path: str) -> bool:
+    return path.lower().endswith(SUPPORTED_REPO_IMAGE_EXTENSIONS)
+
+
+def _has_unsupported_media_extension(path: str) -> bool:
+    return path.lower().endswith(UNSUPPORTED_REPO_MEDIA_EXTENSIONS)
+
+
+def _same_repo_github_image_path(url: str, repo_id: str) -> str | None:
+    """
+    Convert same-repository GitHub image URLs into repo-relative paths.
+
+    Supported examples:
+    - https://raw.githubusercontent.com/owner/repo/main/docs/flow.png
+    - https://github.com/owner/repo/blob/main/docs/flow.png
+    - https://github.com/owner/repo/raw/main/docs/flow.png
+
+    External GitHub/CDN/user-content URLs return None.
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+
+    try:
+        owner, repo = repo_id.split("/", 1)
+    except ValueError:
+        return None
+
+    if host == "raw.githubusercontent.com":
+        if len(parts) >= 4 and parts[0] == owner and parts[1] == repo:
+            return "/".join(parts[3:])
+        return None
+
+    if host in {"github.com", "www.github.com"}:
+        if (
+            len(parts) >= 5
+            and parts[0] == owner
+            and parts[1] == repo
+            and parts[2] in {"blob", "raw"}
+        ):
+            return "/".join(parts[4:])
+        return None
+
+    return None
+
+
+def _resolve_repo_image_path(raw_path: str, current_file_path: str, repo_id: str) -> tuple[str | None, str]:
+    """
+    Resolve an image reference from Markdown/HTML to a repo-relative path.
+
+    This preserves the original multimodal RAG design:
+    valid repo-owned images are still downloaded, saved as parent image objects,
+    linked with image_sniper documents, and attached to section metadata.
+
+    This only filters out noisy/non-repo image references before download:
+    external ads/CDNs/badges, videos/media, and unresolved template paths.
+    """
+    cleaned = _clean_image_reference(raw_path)
+
+    if not cleaned:
+        return None, "empty image reference"
+
+    if _has_unresolved_template_tokens(cleaned):
+        return None, "unresolved template path"
+
+    if _has_unsupported_media_extension(cleaned):
+        return None, "unsupported media file"
+
+    parsed = urlparse(cleaned)
+    already_repo_relative = False
+
+    # External URL: only ingest if it is a same-repo GitHub raw/blob image.
+    # The converted same_repo_path is already relative to the repository root.
+    if parsed.scheme in {"http", "https"}:
+        same_repo_path = _same_repo_github_image_path(cleaned, repo_id)
+        if not same_repo_path:
+            return None, "external image URL"
+        cleaned = same_repo_path
+        already_repo_relative = True
+
+    # Other schemes like data:, mailto:, javascript:, etc. are not repo files.
+    elif parsed.scheme:
+        return None, f"unsupported URL scheme: {parsed.scheme}"
+
+    if _has_unresolved_template_tokens(cleaned):
+        return None, "unresolved template path"
+
+    if not _has_supported_image_extension(cleaned):
+        return None, "not a supported repo image extension"
+
+    # Same-repo GitHub URLs and root-relative image paths are repo-root-relative.
+    # Normal relative paths are resolved relative to the Markdown file.
+    if already_repo_relative:
+        resolved = os.path.normpath(cleaned).lstrip("./").lstrip("/")
+    elif cleaned.startswith("/"):
+        resolved = os.path.normpath(cleaned).lstrip("/")
+    else:
+        base_dir = os.path.dirname(current_file_path)
+        resolved = os.path.normpath(os.path.join(base_dir, cleaned)).lstrip("./").lstrip("/")
+
+    # Prevent paths that normalize outside the repository.
+    if not resolved or resolved == "." or resolved.startswith("../") or "/../" in resolved:
+        return None, "image path resolves outside repository"
+
+    if not _has_supported_image_extension(resolved):
+        return None, "not a supported repo image extension"
+
+    return resolved, "repo image"
+
 
 
 async def ingest_repository(repo_id: str, chat_adapter=None, channel_id=None, thread_ts=None, message_id=None):
@@ -198,13 +360,20 @@ async def ingest_repository(repo_id: str, chat_adapter=None, channel_id=None, th
                     detected_img_path = html_img_match.group(1).strip()
 
                 if detected_img_path:
-                    if detected_img_path.startswith(('http://', 'https://', 'data:image')):
-                        continue 
+                    target_image_path, skip_reason = _resolve_repo_image_path(
+                        raw_path=detected_img_path,
+                        current_file_path=file_path,
+                        repo_id=repo_id,
+                    )
+
+                    if not target_image_path:
+                        print(
+                            f"↪️ Skipping image reference in {file_path}: "
+                            f"{detected_img_path} ({skip_reason})"
+                        )
+                        continue
 
                     try:
-                        base_dir = os.path.dirname(file_path)
-                        target_image_path = os.path.normpath(os.path.join(base_dir, detected_img_path)).lstrip('./').lstrip('/')
-                        
                         img_b64_uri = await client.download_image_as_base64(repo_id, target_image_path)
                         
                         if img_b64_uri:
