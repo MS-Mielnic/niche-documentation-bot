@@ -38,6 +38,53 @@ TEXT_MODEL = "llama3.1:latest"
 VISION_MODEL = "llama3.2-vision:latest"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
+REPO_DISCOVERY_PATTERNS = [
+    r"\bi would like to search for\b",
+    r"\bi want to search for\b",
+    r"\bsearch for\b",
+    r"\blook for\b",
+    r"\bfind\b.*\b(repo|repository|github|documentation|docs)\b",
+    r"\bingest\b",
+    r"\bindex\b",
+    r"\bsync\b",
+    r"\badd\b.*\b(repo|repository|github|documentation|docs)\b",
+    r"\bread\b.*\b(repo|repository|github|documentation|docs)\b",
+    r"\buse\b.*\b(repo|repository|github|documentation|docs)\b",
+    r"\bdata from\b",
+    r"\bdocumentation from\b",
+    r"\bdocumentation about\b",
+    r"\bdocs from\b",
+    r"\bdocs about\b",
+    r"\bdocs for\b",
+    r"\bi want to know about\b",
+    r"\bi would like to know about\b",
+    r"\bi need info on\b",
+    r"\bi need information on\b",
+    r"\bi want to learn about\b",
+    r"\btell me about\b.*\b(repo|repository|github|documentation|docs)\b",
+]
+
+
+def _strip_slack_mentions(text: str) -> str:
+    return re.sub(r"<@[A-Z0-9]+>|@\w+", " ", text or "").strip()
+
+
+def looks_like_repo_discovery_request(user_request: str) -> bool:
+    """
+    Detect topic/repo onboarding requests.
+
+    This intentionally includes broad topic language because users often do not
+    know the exact GitHub repository name. Examples:
+    - I want to know about IoT
+    - I need info on OpenAI embeddings
+    - I would like to search for pandas
+    """
+    normalized = _strip_slack_mentions(user_request).lower()
+    normalized = " ".join(normalized.split())
+
+    return any(re.search(pattern, normalized) for pattern in REPO_DISCOVERY_PATTERNS)
+
+
 def _approx_message_chars(messages) -> int:
     """
     Estimate prompt size in characters without storing prompt content in traces.
@@ -82,8 +129,17 @@ def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
     current_span.set_attribute("llm.model_used", VISION_MODEL)
 
     user_request = state["user_request"]
+    has_repo_context = bool(state.get("selected_repo"))
 
     print(f"--- NODE 0: CLASSIFYING INTENT FOR: '{user_request}' ---")
+    print(f"--- ROUTER CONTEXT: has_repo_context={has_repo_context}, selected_repo={state.get('selected_repo')} ---")
+
+    if looks_like_repo_discovery_request(user_request) and not has_repo_context:
+        print("--- DETERMINISTIC ROUTER: BROAD REPO/TOPIC DISCOVERY REQUEST DETECTED ---")
+        current_span.set_attribute("intent.router", "deterministic_repo_discovery")
+        current_span.set_attribute("intent.has_repo_context", has_repo_context)
+        current_span.set_attribute("intent.classification", "NEW_REPO_REQUEST")
+        return {"user_intent": "NEW_REPO_REQUEST"}
 
     llm = ChatOpenAI(
         temperature=0, 
@@ -94,26 +150,54 @@ def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
     )
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a highly efficient routing AI. 
-        Analyze the user's message and classify it into EXACTLY ONE of the following three categories:
-        
-        1. GREETING: The user is saying hello, expressing thanks, or making casual conversation.
-        2. KNOWLEDGE_QUERY: The user is asking a question about code, documentation, or technical systems.
-        3. NEW_REPO_REQUEST: The user is explicitly asking you to read, ingest, or look at a new GitHub repository.
-        
-        Respond with ONLY the category name. Do not include any other text."""),
+        ("system", """You are a highly efficient routing AI.
+Analyze the user's message and classify it into EXACTLY ONE of the following three categories.
+
+Repository context matters:
+- If there is NO current repository context and the user asks for a broad technical topic, product, library, framework, or documentation source, classify as NEW_REPO_REQUEST. The user may not know the exact GitHub repo name.
+- If there IS current repository context and the user asks a specific technical question, classify as KNOWLEDGE_QUERY so the app answers from the already loaded Chroma/RAG context.
+- If the user explicitly asks to search, ingest, sync, add, read, or use a new repo/source/topic, classify as NEW_REPO_REQUEST.
+
+Categories:
+1. GREETING: The user is saying hello, expressing thanks, or making casual conversation.
+2. KNOWLEDGE_QUERY: The user is asking a specific technical question against an already selected or loaded repository context.
+3. NEW_REPO_REQUEST: The user is asking to discover, search, use, ingest, read, or set up a GitHub repository or technical topic as a knowledge source.
+
+Examples of NEW_REPO_REQUEST:
+- I want to know about IoT
+- I need info on OpenAI embeddings
+- I want documentation about LangGraph
+- I would like to search for pandas
+- I want to use Kubernetes docs
+- Can you look for a repo about vehicle telemetry?
+
+Examples of KNOWLEDGE_QUERY:
+- What is the core architecture of this repository?
+- What are the guidelines for contributing?
+- List the main dependencies used in this project.
+- How does this repo handle authentication?
+
+Current repo context exists: {has_repo_context}
+
+Respond with ONLY the category name. Do not include numbering, punctuation, or explanation."""),
         ("user", "{user_request}")
     ])
 
     chain = prompt | llm
-    response = chain.invoke({"user_request": user_request})
+    response = chain.invoke({
+        "user_request": user_request,
+        "has_repo_context": str(has_repo_context),
+    })
     intent = response.content.strip().upper()
 
     # Fallback safety
     valid_intents = ["GREETING", "KNOWLEDGE_QUERY", "NEW_REPO_REQUEST"]
     if intent not in valid_intents:
-        print(f"--- WARNING: LLM returned invalid intent '{intent}'. Defaulting to KNOWLEDGE_QUERY ---")
-        intent = "KNOWLEDGE_QUERY"
+        print(f"--- WARNING: LLM returned invalid intent '{intent}'. Applying safe fallback ---")
+        if looks_like_repo_discovery_request(user_request) and not has_repo_context:
+            intent = "NEW_REPO_REQUEST"
+        else:
+            intent = "KNOWLEDGE_QUERY"
 
     print(f"--- INTENT CLASSIFIED AS: {intent} ---")
     return {"user_intent": intent}
