@@ -38,6 +38,24 @@ TEXT_MODEL = "llama3.1:latest"
 VISION_MODEL = "llama3.2-vision:latest"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
+
+GENAI_WORKFLOW_NAME = "nichedocbot.repo_rag_answer"
+
+
+def _set_agent_workflow_attrs(span, phase: str, operation_name: str | None = None) -> None:
+    """
+    Add portable OpenTelemetry GenAI-style attributes while preserving
+    existing NicheDocBot-specific attributes.
+
+    Only set gen_ai.operation.name when the span maps to a known GenAI operation.
+    Use workflow.phase for NicheDocBot-specific agent phases.
+    """
+    span.set_attribute("gen_ai.workflow.name", GENAI_WORKFLOW_NAME)
+    span.set_attribute("workflow.phase", phase)
+    if operation_name:
+        span.set_attribute("gen_ai.operation.name", operation_name)
+
+
 REPO_DISCOVERY_PATTERNS = [
     r"\bi would like to search for\b",
     r"\bi want to search for\b",
@@ -125,8 +143,11 @@ def classify_intent(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
     """
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "intent_classification")
+    _set_agent_workflow_attrs(current_span, phase="classify_intent")
     current_span.set_attribute("llm.model", VISION_MODEL)
     current_span.set_attribute("llm.model_used", VISION_MODEL)
+    current_span.set_attribute("gen_ai.provider.name", "ollama")
+    current_span.set_attribute("gen_ai.request.model", VISION_MODEL)
 
     user_request = state["user_request"]
     has_repo_context = bool(state.get("selected_repo"))
@@ -211,6 +232,7 @@ async def check_chroma_db(state: AgentState) -> Dict[str, Any]:
     """
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "knowledge_query")
+    _set_agent_workflow_attrs(current_span, phase="repo_readiness")
     print("--- NODE 1: CHECKING LOCAL CHROMA DB ---")
     
     repo_to_check = state.get("selected_repo") or state.get("user_request")
@@ -221,9 +243,11 @@ async def check_chroma_db(state: AgentState) -> Dict[str, Any]:
 
     current_span.set_attribute("rag.repo", repo_to_check)
     current_span.set_attribute("db.repo_checked", repo_to_check)
+    current_span.set_attribute("repo.name", repo_to_check)
     exists = check_if_repo_exists(repo_id=repo_to_check)
     current_span.set_attribute("rag.local_db_found", exists)
     current_span.set_attribute("db.found", exists)
+    current_span.set_attribute("repo.db_has_data", exists)
     
     if exists:
         print(f"--- DATABASE FOUND FOR: {repo_to_check} ---")
@@ -287,6 +311,7 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     # Grab the current span so we can attach RAG data to it
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "rag_answer")
+    _set_agent_workflow_attrs(current_span, phase="rag_answer", operation_name="chat")
 
     user_request = state["user_request"]
     repo_to_check = state.get("selected_repo") or user_request
@@ -448,8 +473,11 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     current_span.set_attribute("rag.query", user_request)
     current_span.set_attribute("rag.repo", repo_to_check)
     current_span.set_attribute("rag.repo_target", repo_to_check)
+    current_span.set_attribute("repo.name", repo_to_check)
     current_span.set_attribute("rag.retrieval.chunk_count", len(docs_with_scores))
     current_span.set_attribute("rag.retrieved_chunks_count", len(docs_with_scores))
+    current_span.set_attribute("rag.documents_retrieved", len(docs_with_scores))
+    current_span.set_attribute("rag.empty_result", len(docs_with_scores) == 0)
     
     # If chunks were found, record the best score to monitor retrieval drift over time
     best_score = None
@@ -484,6 +512,9 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
         current_span.set_attribute("llm.model", VISION_MODEL)
         current_span.set_attribute("llm.model_used", VISION_MODEL)
         current_span.set_attribute("llm.is_multimodal", True)
+        current_span.set_attribute("gen_ai.provider.name", "ollama")
+        current_span.set_attribute("gen_ai.request.model", VISION_MODEL)
+        current_span.set_attribute("gen_ai.output.type", "text")
         llm = ChatOpenAI(
                 temperature=0, 
                 # This will now use the environment variable, or fall back to localhost if it's missing
@@ -506,6 +537,9 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
         current_span.set_attribute("llm.model", TEXT_MODEL)
         current_span.set_attribute("llm.model_used", TEXT_MODEL)
         current_span.set_attribute("llm.is_multimodal", False)
+        current_span.set_attribute("gen_ai.provider.name", "ollama")
+        current_span.set_attribute("gen_ai.request.model", TEXT_MODEL)
+        current_span.set_attribute("gen_ai.output.type", "text")
         llm = ChatOpenAI(
             base_url=OLLAMA_BASE_URL,
             api_key="local-llm", 
@@ -545,8 +579,10 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
 
     if prompt_tokens is not None:
         current_span.set_attribute("llm.prompt_tokens", int(prompt_tokens))
+        current_span.set_attribute("gen_ai.usage.input_tokens", int(prompt_tokens))
     if completion_tokens is not None:
         current_span.set_attribute("llm.completion_tokens", int(completion_tokens))
+        current_span.set_attribute("gen_ai.usage.output_tokens", int(completion_tokens))
     if total_tokens is not None:
         current_span.set_attribute("llm.total_tokens", int(total_tokens))
 
@@ -597,8 +633,12 @@ async def search_github(state: AgentState, config: RunnableConfig) -> Dict[str, 
 
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "github_search")
+    _set_agent_workflow_attrs(current_span, phase="repo_discovery", operation_name="execute_tool")
+    current_span.set_attribute("gen_ai.tool.name", "github_search")
     current_span.set_attribute("llm.model", TEXT_MODEL)
     current_span.set_attribute("llm.model_used", TEXT_MODEL)
+    current_span.set_attribute("gen_ai.provider.name", "ollama")
+    current_span.set_attribute("gen_ai.request.model", TEXT_MODEL)
 
     user_request = state["user_request"]
     
@@ -692,6 +732,7 @@ async def wait_for_human(state: AgentState, config: RunnableConfig) -> Dict[str,
     """
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "human_approval")
+    _set_agent_workflow_attrs(current_span, phase="human_approval")
     print("--- NODE 4: WAITING FOR HUMAN APPROVAL ---")
     
     repo_options = state.get("repo_options", [])
@@ -754,6 +795,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     # 1. Grab the current span at the very beginning
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "repo_ingestion")
+    _set_agent_workflow_attrs(current_span, phase="repo_ingestion")
 
     selected_repo = state.get("selected_repo")
     if not selected_repo:
@@ -765,6 +807,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     # 2. Attach the target repository to the span
     current_span.set_attribute("rag.repo", selected_repo)
     current_span.set_attribute("ingestion.repo_target", selected_repo)
+    current_span.set_attribute("repo.name", selected_repo)
     
     chat_adapter = config["configurable"].get("chat_adapter")
     channel_id = state.get("channel_id")
@@ -781,13 +824,17 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
 
     if latest_hash:
         current_span.set_attribute("ingestion.latest_hash", latest_hash)
+        current_span.set_attribute("repo.github_latest_commit", latest_hash)
     if local_hash:
         current_span.set_attribute("ingestion.local_hash", local_hash)
+        current_span.set_attribute("repo.local_commit", local_hash)
 
 
     if latest_hash and latest_hash == local_hash:
         print(f"--- JIT MATCH: '{selected_repo}' is already up to date (Hash: {latest_hash}). Skipping ingestion. ---")
         current_span.set_attribute("ingestion.sync_required", False)
+        current_span.set_attribute("repo.sync_required", False)
+        current_span.set_attribute("repo.sync_status", "up_to_date")
         if chat_adapter and channel_id:
             await chat_adapter.send_message(
                 channel_id=channel_id,
@@ -798,6 +845,8 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
     
     # Mark that a full sync is initiating
     current_span.set_attribute("ingestion.sync_required", True)
+    current_span.set_attribute("repo.sync_required", True)
+    current_span.set_attribute("repo.sync_status", "sync_required")
     
     # 2. THE INGESTION ENGINE (Executes if new repo OR if hashes differ)
     message_id = None # <-- NEW: Variable to hold our target message pointer
@@ -831,6 +880,7 @@ async def throttled_ingestion(state: AgentState, config: RunnableConfig) -> Dict
         )
         #  Attach the ultimate success/fail status of the pipeline   
         current_span.set_attribute("ingestion.success", success)
+        current_span.set_attribute("repo.sync_success", success)
         if success:
             # 3. SAVE THE NEW HASH ON SUCCESS
             if latest_hash:
