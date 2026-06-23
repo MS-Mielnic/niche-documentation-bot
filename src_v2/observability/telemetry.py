@@ -14,6 +14,12 @@ tracer = trace.get_tracer("nichedocbot.tracer")
 # This meter emits custom application metrics for Splunk dashboards.
 meter = metrics.get_meter("nichedocbot.metrics")
 
+workflow_phase_count = meter.create_counter(
+    name="nichedocbot.workflow.phase.count",
+    unit="{phase}",
+    description="Count of NicheDocBot agent workflow phases executed.",
+)
+
 rag_retrieval_duration_ms = meter.create_histogram(
     name="rag.retrieval.duration_ms",
     unit="ms",
@@ -62,6 +68,29 @@ def _clean_metric_attributes(attributes: dict) -> dict:
     Remove None values before sending attributes to OpenTelemetry metrics.
     """
     return {key: value for key, value in attributes.items() if value is not None}
+
+
+def record_workflow_phase_metric(
+    *,
+    phase: str,
+    workflow_name: str = "nichedocbot.repo_rag_answer",
+    operation_name: Optional[str] = None,
+) -> None:
+    """
+    Emit a portable OpenTelemetry metric for agent workflow dashboarding.
+
+    Traces explain the path. This metric makes workflow phases easy to chart
+    across observability backends without depending on vendor-specific span tag
+    indexing.
+    """
+    attrs = _clean_metric_attributes({
+        "workflow.phase": phase,
+        "gen_ai.workflow.name": workflow_name,
+        "gen_ai.operation.name": operation_name,
+        "service.name": os.getenv("OTEL_SERVICE_NAME"),
+    })
+
+    workflow_phase_count.add(1, attrs)
 
 
 def record_rag_retrieval_metrics(

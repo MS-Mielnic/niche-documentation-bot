@@ -7,6 +7,7 @@ from src_v2.observability.telemetry import (
     add_retrieved_document_events,
     record_rag_retrieval_metrics,
     record_llm_metrics,
+    record_workflow_phase_metric,
 )
 from typing import Dict, Any
 from src_v2.rag.vector_store import get_local_hash, save_local_hash, get_vector_store, check_if_repo_exists
@@ -54,6 +55,12 @@ def _set_agent_workflow_attrs(span, phase: str, operation_name: str | None = Non
     span.set_attribute("workflow.phase", phase)
     if operation_name:
         span.set_attribute("gen_ai.operation.name", operation_name)
+
+    record_workflow_phase_metric(
+        phase=phase,
+        workflow_name=GENAI_WORKFLOW_NAME,
+        operation_name=operation_name,
+    )
 
 
 REPO_DISCOVERY_PATTERNS = [
