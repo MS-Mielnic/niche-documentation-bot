@@ -172,10 +172,10 @@ xxhash==3.7.0
 yarl==1.23.0
 zipp==3.23.1
 zstandard==0.25.0
-opentelemetry-distro
-opentelemetry-exporter-otlp
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-httpx
-opentelemetry-instrumentation-sqlite3
+opentelemetry-distro==0.62b1
+opentelemetry-exporter-otlp==1.41.1
+opentelemetry-instrumentation-fastapi==0.62b1
+opentelemetry-instrumentation-httpx==0.62b1
+opentelemetry-instrumentation-sqlite3==0.62b1
+opentelemetry-util-genai==0.4b0
+splunk-otel-util-genai==0.1.14
