@@ -9,6 +9,12 @@ from src_v2.observability.telemetry import (
     record_llm_metrics,
     record_workflow_phase_metric,
 )
+from src_v2.observability.genai_telemetry import (
+    llm_chat_invocation,
+    retrieval_invocation,
+    text_output,
+)
+
 from typing import Dict, Any
 from src_v2.rag.vector_store import get_local_hash, save_local_hash, get_vector_store, check_if_repo_exists
 from src_v2.rag.ingestion import ingest_repository
@@ -318,16 +324,37 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     # Grab the current span so we can attach RAG data to it
     current_span = trace.get_current_span()
     current_span.set_attribute("workflow.type", "rag_answer")
-    _set_agent_workflow_attrs(current_span, phase="rag_answer", operation_name="chat")
+    _set_agent_workflow_attrs(current_span, phase="rag_answer")
 
     user_request = state["user_request"]
     repo_to_check = state.get("selected_repo") or user_request
     
     current_span.set_attribute("rag.repo", repo_to_check)
     vector_db = get_vector_store(repo_to_check)
-    retrieval_start = time.perf_counter()
-    docs_with_scores = vector_db.similarity_search_with_score(user_request, k=6)
-    retrieval_duration_ms = (time.perf_counter() - retrieval_start) * 1000
+    with retrieval_invocation(
+        query=user_request,
+        top_k=6,
+        attributes={
+            "repo.name": repo_to_check,
+            "workflow.phase": "rag_answer",
+        },
+    ) as genai_retrieval:
+        retrieval_start = time.perf_counter()
+        docs_with_scores = vector_db.similarity_search_with_score(user_request, k=6)
+        retrieval_duration_ms = (time.perf_counter() - retrieval_start) * 1000
+
+        retrieval_span = trace.get_current_span()
+        retrieval_span.set_attribute("retrieval.duration_ms", retrieval_duration_ms)
+        retrieval_span.set_attribute("retrieval.documents_retrieved", len(docs_with_scores))
+        retrieval_span.set_attribute("retrieval.results_count", len(docs_with_scores))
+        retrieval_span.set_attribute("retrieval.top_k", 6)
+
+        if genai_retrieval is not None:
+            genai_retrieval.tool_result = {
+                "documents_retrieved": len(docs_with_scores),
+                "top_k": 6,
+            }
+
     current_span.set_attribute("rag.retrieval.duration_ms", retrieval_duration_ms)
     
     add_retrieved_document_events(
@@ -563,48 +590,70 @@ async def prompt_for_query(state: AgentState, config: RunnableConfig) -> Dict[st
     approx_prompt_chars = _approx_message_chars(messages)
     current_span.set_attribute("llm.approx_prompt_chars", approx_prompt_chars)
 
-    llm_start = time.perf_counter()
-    response = await llm.ainvoke(messages)
-    llm_latency_ms = (time.perf_counter() - llm_start) * 1000
+    with llm_chat_invocation(
+        request_model=selected_llm_model,
+        input_text=user_request,
+        attributes={
+            "repo.name": repo_to_check,
+            "workflow.phase": "rag_answer",
+            "llm.is_multimodal": bool(vision_images),
+        },
+    ) as genai_llm:
+        llm_start = time.perf_counter()
+        response = await llm.ainvoke(messages)
+        llm_latency_ms = (time.perf_counter() - llm_start) * 1000
 
-    usage_metadata = getattr(response, "usage_metadata", None) or {}
-    response_metadata = getattr(response, "response_metadata", None) or {}
-    token_usage = response_metadata.get("token_usage") or {}
+        usage_metadata = getattr(response, "usage_metadata", None) or {}
+        response_metadata = getattr(response, "response_metadata", None) or {}
+        token_usage = response_metadata.get("token_usage") or {}
 
-    prompt_tokens = (
-        usage_metadata.get("input_tokens")
-        or token_usage.get("prompt_tokens")
-    )
-    completion_tokens = (
-        usage_metadata.get("output_tokens")
-        or token_usage.get("completion_tokens")
-    )
-    total_tokens = (
-        usage_metadata.get("total_tokens")
-        or token_usage.get("total_tokens")
-    )
+        prompt_tokens = (
+            usage_metadata.get("input_tokens")
+            or token_usage.get("prompt_tokens")
+        )
+        completion_tokens = (
+            usage_metadata.get("output_tokens")
+            or token_usage.get("completion_tokens")
+        )
+        total_tokens = (
+            usage_metadata.get("total_tokens")
+            or token_usage.get("total_tokens")
+        )
 
-    if prompt_tokens is not None:
-        current_span.set_attribute("llm.prompt_tokens", int(prompt_tokens))
-        current_span.set_attribute("gen_ai.usage.input_tokens", int(prompt_tokens))
-    if completion_tokens is not None:
-        current_span.set_attribute("llm.completion_tokens", int(completion_tokens))
-        current_span.set_attribute("gen_ai.usage.output_tokens", int(completion_tokens))
-    if total_tokens is not None:
-        current_span.set_attribute("llm.total_tokens", int(total_tokens))
+        if prompt_tokens is not None:
+            current_span.set_attribute("llm.prompt_tokens", int(prompt_tokens))
+            current_span.set_attribute("gen_ai.usage.input_tokens", int(prompt_tokens))
+            if genai_llm is not None:
+                genai_llm.input_tokens = int(prompt_tokens)
+        if completion_tokens is not None:
+            current_span.set_attribute("llm.completion_tokens", int(completion_tokens))
+            current_span.set_attribute("gen_ai.usage.output_tokens", int(completion_tokens))
+            if genai_llm is not None:
+                genai_llm.output_tokens = int(completion_tokens)
+        if total_tokens is not None:
+            current_span.set_attribute("llm.total_tokens", int(total_tokens))
 
-    record_llm_metrics(
-        model=selected_llm_model,
-        duration_ms=llm_latency_ms,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        is_multimodal=bool(vision_images),
-        repo_id=repo_to_check,
-        workflow_type="rag_answer",
-    )
+        record_llm_metrics(
+            model=selected_llm_model,
+            duration_ms=llm_latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            is_multimodal=bool(vision_images),
+            repo_id=repo_to_check,
+            workflow_type="rag_answer",
+        )
 
-    response_content = response.content or ""
+        response_content = response.content or ""
+
+        if genai_llm is not None:
+            genai_llm.output_messages.append(
+                text_output(
+                    "assistant",
+                    response_content,
+                    finish_reason="stop",
+                )
+            )
 
     current_span.set_attribute("llm.duration_ms", llm_latency_ms)
     current_span.set_attribute("llm.latency_ms", llm_latency_ms)
